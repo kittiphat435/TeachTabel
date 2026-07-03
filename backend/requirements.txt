@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+google-cloud-firestore
+firebase-admin
+python-multipart
+pydantic
+python-dotenv
+pandas
+openpyxl
