@@ -1,12 +1,12 @@
 <script setup lang="ts">
 import { ref, onMounted, computed } from 'vue'
 import axios from 'axios'
-import { Plus, Users, Trash2, Calendar, Loader2, Search, Info } from 'lucide-vue-next'
+import { Plus, Users, Trash2, Calendar, Loader2, Search, Info, Pencil, X } from 'lucide-vue-next'
 
 const API_BASE = 'http://localhost:8000'
 
 interface Teacher { id: string; full_name: string; department: string }
-interface Unavailability { id: string; teacher_name: string; day_of_week: number; period_number: number; reason: string }
+interface Unavailability { id: string; teacher_id: string; teacher_name: string; day_of_week: number; period_number: number; reason: string }
 
 const teachers = ref<Teacher[]>([])
 const unavailabilities = ref<Unavailability[]>([])
@@ -18,6 +18,7 @@ const selectedTeacherIds = ref<string[]>([])
 const selectedDay = ref(1)
 const selectedPeriod = ref(1)
 const reason = ref('ไม่ว่าง (ธุระส่วนตัว/งานบริหาร)')
+const editingUnavId = ref<string | null>(null)
 
 const days = [
   { val: 1, name: 'จันทร์' },
@@ -49,6 +50,14 @@ const fetchData = async () => {
 
 onMounted(fetchData)
 
+const resetForm = () => {
+  selectedTeacherIds.value = []
+  selectedDay.value = 1
+  selectedPeriod.value = 1
+  reason.value = 'ไม่ว่าง (ธุระส่วนตัว/งานบริหาร)'
+  editingUnavId.value = null
+}
+
 const addUnavailability = async () => {
   if (selectedTeacherIds.value.length === 0) {
     alert('กรุณาเลือกครูอย่างน้อย 1 ท่าน')
@@ -57,23 +66,52 @@ const addUnavailability = async () => {
 
   saving.value = true
   try {
-    await axios.post(`${API_BASE}/unavailabilities/`, {
-      teacher_ids: selectedTeacherIds.value,
-      day_of_week: selectedDay.value,
-      period_number: selectedPeriod.value,
-      reason: reason.value
-    })
-    alert('บันทึกเวลาไม่ว่างสำเร็จ')
+    if (editingUnavId.value) {
+      if (selectedTeacherIds.value.length !== 1) {
+        alert('ตอนแก้ไข กรุณาเลือกครูเพียง 1 ท่าน')
+        saving.value = false
+        return
+      }
+      await axios.put(`${API_BASE}/unavailabilities/${editingUnavId.value}`, {
+        teacher_id: selectedTeacherIds.value[0],
+        day_of_week: selectedDay.value,
+        period_number: selectedPeriod.value,
+        reason: reason.value
+      })
+      alert('แก้ไขเวลาไม่ว่างสำเร็จ')
+    } else {
+      await axios.post(`${API_BASE}/unavailabilities/`, {
+        teacher_ids: selectedTeacherIds.value,
+        day_of_week: selectedDay.value,
+        period_number: selectedPeriod.value,
+        reason: reason.value
+      })
+      alert('บันทึกเวลาไม่ว่างสำเร็จ')
+    }
     await fetchData()
-    selectedTeacherIds.value = []
-  } catch (error) { alert('Error saving') }
+    resetForm()
+  } catch (error) { alert('เกิดข้อผิดพลาดในการบันทึก') }
   finally { saving.value = false }
+}
+
+const startEditUnav = (u: Unavailability) => {
+  editingUnavId.value = u.id
+  selectedTeacherIds.value = [u.teacher_id]
+  selectedDay.value = u.day_of_week
+  selectedPeriod.value = u.period_number
+  reason.value = u.reason
+  window.scrollTo({ top: 0, behavior: 'smooth' })
+}
+
+const cancelEditUnav = () => {
+  resetForm()
 }
 
 const deleteUnav = async (id: string) => {
   if (!confirm('ยืนยันการลบ?')) return
   try {
     await axios.delete(`${API_BASE}/unavailabilities/${id}`)
+    if (editingUnavId.value === id) resetForm()
     await fetchData()
   } catch (error) { alert('Error deleting') }
 }
@@ -84,8 +122,9 @@ const deleteUnav = async (id: string) => {
     <!-- Form -->
     <div class="xl:col-span-1 bg-white p-6 rounded-xl shadow-sm border border-gray-200 h-fit sticky top-6 text-gray-900">
       <h2 class="text-lg font-bold mb-4 flex items-center gap-2 text-blue-600">
-        <Calendar class="w-5 h-5" /> ล็อกเวลาปฏิบัติงานครู
+        <Calendar class="w-5 h-5" /> {{ editingUnavId ? 'แก้ไขเวลาล็อก' : 'ล็อกเวลาปฏิบัติงานครู' }}
       </h2>
+      <p v-if="editingUnavId" class="text-[10px] text-yellow-700 bg-yellow-50 border border-yellow-200 rounded-md p-2 -mt-2 mb-3">กำลังแก้ไข — เลือกครูได้เพียง 1 ท่านตอนแก้ไข</p>
 
       <div class="space-y-4">
         <div>
@@ -120,13 +159,20 @@ const deleteUnav = async (id: string) => {
           </div>
         </div>
 
-        <button 
-          @click="addUnavailability" 
+        <button
+          @click="addUnavailability"
           :disabled="saving"
           class="w-full bg-blue-600 text-white font-bold py-3 rounded-lg hover:bg-blue-700 transition disabled:bg-gray-300 flex items-center justify-center gap-2 shadow-md"
         >
           <Loader2 v-if="saving" class="w-4 h-4 animate-spin" />
-          บันทึกเวลาล็อก
+          {{ editingUnavId ? 'บันทึกการแก้ไข' : 'บันทึกเวลาล็อก' }}
+        </button>
+        <button
+          v-if="editingUnavId"
+          @click="cancelEditUnav"
+          class="w-full text-gray-500 text-sm font-bold py-2 rounded-lg hover:bg-gray-100 transition flex items-center justify-center gap-1"
+        >
+          <X class="w-3.5 h-3.5" /> ยกเลิกการแก้ไข
         </button>
       </div>
     </div>
@@ -146,13 +192,16 @@ const deleteUnav = async (id: string) => {
             </tr>
           </thead>
           <tbody class="divide-y divide-gray-100">
-            <tr v-for="u in unavailabilities" :key="u.id" class="hover:bg-blue-50">
+            <tr v-for="u in unavailabilities" :key="u.id" :class="['hover:bg-blue-50', editingUnavId === u.id ? 'bg-yellow-50' : '']">
               <td class="px-4 py-4 font-bold text-blue-700">
                 {{ days.find(d => d.val === u.day_of_week)?.name }} คาบ {{ u.period_number }}
               </td>
               <td class="px-4 py-4 font-medium">{{ u.teacher_name }}</td>
               <td class="px-4 py-4 text-gray-500 italic">{{ u.reason }}</td>
-              <td class="px-4 py-4 text-center text-gray-900">
+              <td class="px-4 py-4 text-center text-gray-900 whitespace-nowrap">
+                <button @click="startEditUnav(u)" class="text-gray-400 hover:text-blue-600 transition mr-2">
+                  <Pencil class="w-4 h-4" />
+                </button>
                 <button @click="deleteUnav(u.id)" class="text-gray-400 hover:text-red-600 transition">
                   <Trash2 class="w-4 h-4" />
                 </button>

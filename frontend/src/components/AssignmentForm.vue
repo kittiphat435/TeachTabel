@@ -1,11 +1,12 @@
 <script setup lang="ts">
-import { ref, onMounted, computed, watch } from 'vue'
+import { ref, onMounted, computed, watch, nextTick } from 'vue'
 import axios from 'axios'
-import { Plus, Users, BookOpen, Home, Clock, Loader2, MapPin, Search, UserPlus } from 'lucide-vue-next'
+import { Plus, Users, BookOpen, Home, Clock, Loader2, MapPin, Search, UserPlus, Flag, Pencil, Trash2, X } from 'lucide-vue-next'
+import SearchableSelect from './SearchableSelect.vue'
 
 const API_BASE = 'http://localhost:8000'
 
-interface Teacher { id: string; full_name: string; department: string }
+interface Teacher { id: string; full_name: string; department: string; teacher_code?: string | null }
 interface Subject { id: string; subject_code: string; subject_name: string }
 interface Classroom { id: string; grade_level: string; room_name: string }
 interface Room { id: string; room_name: string; room_type: string }
@@ -23,15 +24,38 @@ const saving = ref(false)
 const selectedSubject = ref('')
 const selectedTeachers = ref<string[]>([])
 const selectedClassrooms = ref<string[]>([])
-const selectedRoom = ref('')
+// ห้องปฏิบัติการที่ครูวิชานี้สอนได้ (เลือกได้หลายห้อง เช่น ครูคอมเลือก 123, 125, 138)
+// ถ้าไม่เลือกเลย = สอนที่ห้องประจำของนักเรียนเอง ไม่ต้องจองห้องแยก
+const selectedRoomIds = ref<string[]>([])
 const totalPeriods = ref(2)
 const selectedSplitPattern = ref<number[]>([2])
+const isScout = ref(false)
+const editingAssignmentId = ref<string | null>(null)
 
 // Search States
 const teacherSearch = ref('')
 const filteredTeachers = computed(() => {
   if (!teacherSearch.value) return teachers.value
-  return teachers.value.filter(t => t.full_name.includes(teacherSearch.value))
+  const q = teacherSearch.value
+  return teachers.value.filter(t => t.full_name.includes(q) || (t.teacher_code || '').includes(q))
+})
+
+const classroomSearch = ref('')
+const filteredClassrooms = computed(() => {
+  if (!classroomSearch.value) return classrooms.value
+  return classrooms.value.filter(c => `${c.grade_level}/${c.room_name}`.includes(classroomSearch.value))
+})
+
+const subjectOptions = computed(() =>
+  subjects.value.map(s => ({ value: s.id, label: `${s.subject_code} - ${s.subject_name}` }))
+)
+
+// เฉพาะห้องปฏิบัติการ (ห้องประจำชั้นไม่ต้องเลือก เพราะสอนที่ห้องนักเรียนเองอยู่แล้ว)
+const labRooms = computed(() => rooms.value.filter(r => r.room_type === 'ห้องปฏิบัติการ'))
+const roomSearch = ref('')
+const filteredRooms = computed(() => {
+  if (!roomSearch.value) return labRooms.value
+  return labRooms.value.filter(r => r.room_name.includes(roomSearch.value))
 })
 
 // Quick Add Teacher
@@ -92,36 +116,76 @@ const fetchData = async () => {
 
 onMounted(fetchData)
 
-const addAssignment = async () => {
+const resetForm = () => {
+  selectedTeachers.value = []
+  selectedClassrooms.value = []
+  selectedSubject.value = ''
+  selectedRoomIds.value = []
+  totalPeriods.value = 2
+  selectedSplitPattern.value = [2]
+  isScout.value = false
+  editingAssignmentId.value = null
+}
+
+const saveAssignment = async () => {
   if (!selectedSubject.value || selectedTeachers.value.length === 0 || selectedClassrooms.value.length === 0) {
     alert('กรุณากรอกข้อมูลให้ครบถ้วน')
     return
   }
 
   saving.value = true
+  const payload = {
+    subject_id: selectedSubject.value,
+    teacher_ids: selectedTeachers.value,
+    classroom_ids: selectedClassrooms.value,
+    room_ids: selectedRoomIds.value,
+    total_periods: totalPeriods.value,
+    period_split: selectedSplitPattern.value,
+    is_scout: isScout.value
+  }
   try {
-    const payload = {
-      subject_id: selectedSubject.value,
-      teacher_ids: selectedTeachers.value,
-      classroom_ids: selectedClassrooms.value,
-      room_id: selectedRoom.value || null,
-      total_periods: totalPeriods.value,
-      period_split: selectedSplitPattern.value
+    if (editingAssignmentId.value) {
+      await axios.put(`${API_BASE}/assignments/${editingAssignmentId.value}`, payload)
+      alert('แก้ไขภาระงานสำเร็จ')
+    } else {
+      await axios.post(`${API_BASE}/assignments/`, payload)
+      alert('บันทึกภาระงานสำเร็จ')
     }
-
-    await axios.post(`${API_BASE}/assignments/`, payload)
-    alert('บันทึกภาระงานสำเร็จ')
     await fetchData()
-    
-    // Reset
-    selectedTeachers.value = []
-    selectedClassrooms.value = []
-    selectedSubject.value = ''
-    selectedRoom.value = ''
+    resetForm()
   } catch (error) {
     alert('เกิดข้อผิดพลาดในการบันทึก')
   } finally {
     saving.value = false
+  }
+}
+
+const startEditAssignment = async (a: any) => {
+  editingAssignmentId.value = a.id
+  selectedSubject.value = a.subject_id
+  selectedTeachers.value = [...(a.teacher_ids || [])]
+  selectedClassrooms.value = [...(a.classroom_ids || [])]
+  selectedRoomIds.value = [...(a.room_ids || [])]
+  isScout.value = !!a.is_scout
+  totalPeriods.value = a.total_periods
+  await nextTick() // รอ watch(totalPeriods) รีเซ็ต selectedSplitPattern ก่อน แล้วค่อยตั้งค่าที่ถูกต้องทับ
+  const match = availablePatterns.value.find(p => JSON.stringify(p) === JSON.stringify(a.period_split))
+  selectedSplitPattern.value = match || a.period_split
+  window.scrollTo({ top: 0, behavior: 'smooth' })
+}
+
+const cancelEditAssignment = () => {
+  resetForm()
+}
+
+const deleteAssignment = async (id: string) => {
+  if (!confirm('ยืนยันการลบภาระงานนี้?')) return
+  try {
+    await axios.delete(`${API_BASE}/assignments/${id}`)
+    if (editingAssignmentId.value === id) resetForm()
+    await fetchData()
+  } catch (error) {
+    alert('ลบไม่สำเร็จ')
   }
 }
 </script>
@@ -131,7 +195,7 @@ const addAssignment = async () => {
     <!-- Left: Entry Form -->
     <div class="xl:col-span-1 bg-white p-6 rounded-xl shadow-sm border border-gray-200 h-fit sticky top-6">
       <h2 class="text-lg font-bold mb-4 flex items-center gap-2 text-blue-600">
-        <Plus class="w-5 h-5" /> มอบหมายภาระงาน
+        <Plus class="w-5 h-5" /> {{ editingAssignmentId ? 'แก้ไขภาระงาน' : 'มอบหมายภาระงาน' }}
       </h2>
       
       <div v-if="loading" class="text-center py-4 text-gray-400">กำลังโหลด...</div>
@@ -140,10 +204,7 @@ const addAssignment = async () => {
         <!-- Subject -->
         <div>
           <label class="block text-xs font-bold text-gray-500 mb-1 uppercase tracking-tight">1. เลือกวิชา</label>
-          <select v-model="selectedSubject" class="w-full border border-gray-300 rounded-md p-2 text-sm focus:ring-blue-500">
-            <option value="">-- เลือกวิชา --</option>
-            <option v-for="s in subjects" :key="s.id" :value="s.id">{{ s.subject_code }} - {{ s.subject_name }}</option>
-          </select>
+          <SearchableSelect v-model="selectedSubject" :options="subjectOptions" placeholder="ค้นหาวิชา เช่น รหัสวิชาหรือชื่อวิชา" />
         </div>
 
         <!-- Teachers -->
@@ -172,7 +233,10 @@ const addAssignment = async () => {
           <div class="max-h-40 overflow-y-auto border border-gray-200 rounded-md p-2 space-y-1 bg-white text-sm">
             <div v-for="t in filteredTeachers" :key="t.id" class="flex items-center hover:bg-blue-50 p-1 rounded transition-colors">
               <input type="checkbox" :id="'t-'+t.id" :value="t.id" v-model="selectedTeachers" class="rounded text-blue-600 focus:ring-blue-500 w-4 h-4">
-              <label :for="'t-'+t.id" class="ml-2 text-xs text-gray-700 cursor-pointer flex-1">{{ t.full_name }}</label>
+              <label :for="'t-'+t.id" class="ml-2 text-xs text-gray-700 cursor-pointer flex-1">
+                <span v-if="t.teacher_code" class="text-gray-400 font-mono">[{{ t.teacher_code }}]</span>
+                {{ t.full_name }}
+              </label>
               <span class="text-[9px] text-gray-400 font-medium uppercase">{{ t.department }}</span>
             </div>
             <div v-if="filteredTeachers.length === 0" class="text-center py-4 text-xs text-gray-400">ไม่พบรายชื่อครู</div>
@@ -185,21 +249,37 @@ const addAssignment = async () => {
         <!-- Classrooms -->
         <div>
           <label class="block text-xs font-bold text-gray-500 mb-1 uppercase tracking-tight">3. ชั้นเรียน (เลือกได้หลายห้อง)</label>
+          <div class="relative mb-2">
+            <Search class="w-3 h-3 absolute left-2 top-2.5 text-gray-400" />
+            <input v-model="classroomSearch" placeholder="ค้นหาห้องเรียน เช่น 1/1" class="w-full text-xs pl-7 pr-2 py-2 border rounded-md bg-gray-50 focus:bg-white outline-none">
+          </div>
           <div class="max-h-32 overflow-y-auto border border-gray-200 rounded-md p-2 space-y-1 bg-gray-50 text-sm">
-            <div v-for="c in classrooms" :key="c.id" class="flex items-center">
+            <div v-for="c in filteredClassrooms" :key="c.id" class="flex items-center">
               <input type="checkbox" :id="'c-'+c.id" :value="c.id" v-model="selectedClassrooms" class="rounded text-blue-600 w-4 h-4">
               <label :for="'c-'+c.id" class="ml-2 text-xs text-gray-600 cursor-pointer">{{ c.grade_level }}/{{ c.room_name }}</label>
             </div>
+            <p v-if="filteredClassrooms.length === 0" class="text-center text-xs text-gray-400 py-2">ไม่พบห้องเรียน</p>
           </div>
         </div>
 
         <!-- Room -->
         <div>
-          <label class="block text-xs font-bold text-gray-500 mb-1 uppercase tracking-tight">4. สถานที่เรียน (ถ้ามี)</label>
-          <select v-model="selectedRoom" class="w-full border border-gray-300 rounded-md p-2 text-sm">
-            <option value="">-- ตามความเหมาะสม (สุ่ม) --</option>
-            <option v-for="r in rooms" :key="r.id" :value="r.id">{{ r.room_name }}</option>
-          </select>
+          <label class="block text-xs font-bold text-gray-500 mb-1 uppercase tracking-tight">4. ห้องปฏิบัติการที่สอนได้ (ถ้ามี)</label>
+          <p class="text-[10px] text-gray-400 mb-1.5">เลือกได้หลายห้อง (เช่น ครูคอมเลือกห้องที่ใกล้กัน) ระบบจะเลือกห้องที่ว่างให้เองตอนจัดตารางอัตโนมัติ — ถ้าไม่เลือกเลย = สอนที่ห้องประจำของนักเรียนเอง</p>
+          <div class="relative mb-2">
+            <Search class="w-3 h-3 absolute left-2 top-2.5 text-gray-400" />
+            <input v-model="roomSearch" placeholder="ค้นหาห้องปฏิบัติการ..." class="w-full text-xs pl-7 pr-2 py-2 border rounded-md bg-gray-50 focus:bg-white outline-none">
+          </div>
+          <div class="max-h-32 overflow-y-auto border border-gray-200 rounded-md p-2 space-y-1 bg-gray-50 text-sm">
+            <div v-for="r in filteredRooms" :key="r.id" class="flex items-center">
+              <input type="checkbox" :id="'r-'+r.id" :value="r.id" v-model="selectedRoomIds" class="rounded text-blue-600 w-4 h-4">
+              <label :for="'r-'+r.id" class="ml-2 text-xs text-gray-600 cursor-pointer">{{ r.room_name }}</label>
+            </div>
+            <p v-if="filteredRooms.length === 0" class="text-center text-xs text-gray-400 py-2">ไม่พบห้องปฏิบัติการ (เพิ่มได้ที่ "จัดการข้อมูลพื้นฐาน")</p>
+          </div>
+          <div class="mt-1 text-[10px] text-blue-600 font-bold" v-if="selectedRoomIds.length > 0">
+            เลือกแล้ว {{ selectedRoomIds.length }} ห้อง
+          </div>
         </div>
 
         <!-- Period Split -->
@@ -216,13 +296,28 @@ const addAssignment = async () => {
           </div>
         </div>
 
-        <button 
-          @click="addAssignment" 
+        <!-- Scout Flag -->
+        <div class="flex items-center gap-2 p-3 bg-yellow-50 rounded-lg border border-yellow-200">
+          <input type="checkbox" id="is-scout" v-model="isScout" class="rounded text-yellow-600 w-4 h-4">
+          <label for="is-scout" class="text-xs font-bold text-yellow-800 cursor-pointer flex items-center gap-1">
+            <Flag class="w-3 h-3" /> วิชาลูกเสือ / เนตรนารี / ยุวกาชาด
+          </label>
+        </div>
+
+        <button
+          @click="saveAssignment"
           :disabled="saving"
           class="w-full bg-blue-600 text-white font-bold py-3 rounded-lg hover:bg-blue-700 transition disabled:bg-gray-300 flex items-center justify-center gap-2 mt-2 shadow-md"
         >
           <Loader2 v-if="saving" class="w-4 h-4 animate-spin" />
-          บันทึกภาระงาน
+          {{ editingAssignmentId ? 'บันทึกการแก้ไข' : 'บันทึกภาระงาน' }}
+        </button>
+        <button
+          v-if="editingAssignmentId"
+          @click="cancelEditAssignment"
+          class="w-full text-gray-500 text-sm font-bold py-2 rounded-lg hover:bg-gray-100 transition flex items-center justify-center gap-1"
+        >
+          <X class="w-3.5 h-3.5" /> ยกเลิกการแก้ไข
         </button>
       </div>
     </div>
@@ -244,10 +339,11 @@ const addAssignment = async () => {
               <th class="px-4 py-4 text-center border-b">คาบ</th>
               <th class="px-4 py-4 text-center border-b">รูปแบบ</th>
               <th class="px-4 py-4 text-left border-b">สถานที่</th>
+              <th class="px-4 py-4 text-center border-b">จัดการ</th>
             </tr>
           </thead>
           <tbody class="divide-y divide-gray-100">
-            <tr v-for="a in assignments" :key="a.id" class="hover:bg-blue-50 transition-colors">
+            <tr v-for="a in assignments" :key="a.id" :class="['hover:bg-blue-50 transition-colors', editingAssignmentId === a.id ? 'bg-yellow-50' : '']">
               <!-- ครู -->
               <td class="px-4 py-4">
                 <div class="flex flex-wrap gap-1">
@@ -266,7 +362,12 @@ const addAssignment = async () => {
               </td>
               <!-- วิชา -->
               <td class="px-4 py-4">
-                <p class="font-bold text-gray-900 leading-tight">{{ a.subject_name.split(' ')[0] }}</p>
+                <p class="font-bold text-gray-900 leading-tight flex items-center gap-1">
+                  {{ a.subject_name.split(' ')[0] }}
+                  <span v-if="a.is_scout" title="วิชาลูกเสือ/เนตรนารี/ยุวกาชาด" class="inline-flex items-center gap-0.5 bg-yellow-100 text-yellow-700 px-1.5 py-0.5 rounded text-[9px] font-black border border-yellow-300">
+                    <Flag class="w-2.5 h-2.5" /> ลูกเสือ
+                  </span>
+                </p>
                 <p class="text-[10px] text-gray-500 font-medium">{{ a.subject_name.split(' ').slice(1).join(' ') }}</p>
               </td>
               <!-- คาบรวม -->
@@ -284,13 +385,24 @@ const addAssignment = async () => {
               </td>
               <!-- สถานที่ -->
               <td class="px-4 py-4 text-gray-600">
-                <div class="flex items-center gap-1 font-medium">
-                  <MapPin class="w-3 h-3 text-red-400" /> {{ a.room_name }}
+                <div v-if="a.room_names && a.room_names.length" class="flex flex-wrap gap-1">
+                  <span v-for="name in a.room_names" :key="name" class="inline-flex items-center gap-1 bg-red-50 text-red-700 px-2 py-0.5 rounded text-[11px] font-bold border border-red-100">
+                    <MapPin class="w-3 h-3" /> {{ name }}
+                  </span>
                 </div>
+                <span v-else class="text-xs text-gray-400 italic">ห้องประจำของนักเรียนเอง</span>
+              </td>
+              <td class="px-4 py-4 text-center whitespace-nowrap">
+                <button @click="startEditAssignment(a)" class="text-gray-400 hover:text-blue-600 transition mr-2">
+                  <Pencil class="w-4 h-4" />
+                </button>
+                <button @click="deleteAssignment(a.id)" class="text-gray-400 hover:text-red-600 transition">
+                  <Trash2 class="w-4 h-4" />
+                </button>
               </td>
             </tr>
             <tr v-if="assignments.length === 0 && !loading">
-              <td colspan="6" class="px-4 py-12 text-center text-gray-400 italic bg-gray-50 rounded-b-xl">
+              <td colspan="7" class="px-4 py-12 text-center text-gray-400 italic bg-gray-50 rounded-b-xl">
                 ยังไม่มีการมอบหมายภาระงานสอน
               </td>
             </tr>

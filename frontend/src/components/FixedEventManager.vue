@@ -1,14 +1,14 @@
 <script setup lang="ts">
 import { ref, onMounted } from 'vue'
 import axios from 'axios'
-import { Plus, Users, Home, Clock, Loader2, Trash2, Calendar, MapPin } from 'lucide-vue-next'
+import { Plus, Users, Home, Clock, Loader2, Trash2, Calendar, MapPin, Pencil, X } from 'lucide-vue-next'
 
 const API_BASE = 'http://localhost:8000'
 
 interface Classroom { id: string; grade_level: string; room_name: string }
 interface Teacher { id: string; full_name: string }
 interface Room { id: string; room_name: string }
-interface FixedEvent { id: string; event_name: string; day_of_week: number; period_number: number; classroom_names: string[]; teacher_names: string[]; room_name: string }
+interface FixedEvent { id: string; event_name: string; day_of_week: number; period_number: number; classroom_names: string[]; teacher_names: string[]; classroom_ids: string[]; teacher_ids: string[]; room_id: string | null; room_name: string }
 
 const classrooms = ref<Classroom[]>([])
 const teachers = ref<Teacher[]>([])
@@ -25,6 +25,7 @@ const selectedPeriod = ref(1)
 const selectedClassrooms = ref<string[]>([])
 const selectedTeachers = ref<string[]>([])
 const selectedRoom = ref('')
+const editingEventId = ref<string | null>(null)
 
 const days = [
   { val: 1, name: 'จันทร์' },
@@ -53,6 +54,16 @@ const fetchData = async () => {
 
 onMounted(fetchData)
 
+const resetForm = () => {
+  eventName.value = ''
+  selectedDay.value = 1
+  selectedPeriod.value = 1
+  selectedClassrooms.value = []
+  selectedTeachers.value = []
+  selectedRoom.value = ''
+  editingEventId.value = null
+}
+
 const addEvent = async () => {
   if (!eventName.value || selectedClassrooms.value.length === 0) {
     alert('กรุณาระบุชื่อกิจกรรมและเลือกอย่างน้อย 1 ชั้นเรียน')
@@ -60,29 +71,48 @@ const addEvent = async () => {
   }
 
   saving.value = true
+  const payload = {
+    event_name: eventName.value,
+    day_of_week: selectedDay.value,
+    period_number: selectedPeriod.value,
+    classroom_ids: selectedClassrooms.value,
+    teacher_ids: selectedTeachers.value,
+    room_id: selectedRoom.value || null
+  }
   try {
-    await axios.post(`${API_BASE}/fixed-events/`, {
-      event_name: eventName.value,
-      day_of_week: selectedDay.value,
-      period_number: selectedPeriod.value,
-      classroom_ids: selectedClassrooms.value,
-      teacher_ids: selectedTeachers.value,
-      room_id: selectedRoom.value || null
-    })
-    alert('บันทึกกิจกรรมสำเร็จ')
+    if (editingEventId.value) {
+      await axios.put(`${API_BASE}/fixed-events/${editingEventId.value}`, payload)
+      alert('แก้ไขกิจกรรมสำเร็จ')
+    } else {
+      await axios.post(`${API_BASE}/fixed-events/`, payload)
+      alert('บันทึกกิจกรรมสำเร็จ')
+    }
     await fetchData()
-    // Reset
-    eventName.value = ''
-    selectedClassrooms.value = []
-    selectedTeachers.value = []
-  } catch (error) { alert('Error saving') }
+    resetForm()
+  } catch (error) { alert('เกิดข้อผิดพลาดในการบันทึก') }
   finally { saving.value = false }
+}
+
+const startEditEvent = (e: FixedEvent) => {
+  editingEventId.value = e.id
+  eventName.value = e.event_name
+  selectedDay.value = e.day_of_week
+  selectedPeriod.value = e.period_number
+  selectedClassrooms.value = [...(e.classroom_ids || [])]
+  selectedTeachers.value = [...(e.teacher_ids || [])]
+  selectedRoom.value = e.room_id || ''
+  window.scrollTo({ top: 0, behavior: 'smooth' })
+}
+
+const cancelEditEvent = () => {
+  resetForm()
 }
 
 const deleteEvent = async (id: string) => {
   if (!confirm('ยืนยันการลบกิจกรรมนี้?')) return
   try {
     await axios.delete(`${API_BASE}/fixed-events/${id}`)
+    if (editingEventId.value === id) resetForm()
     await fetchData()
   } catch (error) { alert('Error deleting') }
 }
@@ -93,7 +123,7 @@ const deleteEvent = async (id: string) => {
     <!-- Form -->
     <div class="xl:col-span-1 bg-white p-6 rounded-xl shadow-sm border border-gray-200 h-fit sticky top-6">
       <h2 class="text-lg font-bold mb-4 flex items-center gap-2 text-red-600">
-        <Calendar class="w-5 h-5" /> เพิ่มภาระงานนักเรียน (กิจกรรมบังคับ)
+        <Calendar class="w-5 h-5" /> {{ editingEventId ? 'แก้ไขภาระงานนักเรียน' : 'เพิ่มภาระงานนักเรียน' }} (กิจกรรมบังคับ)
       </h2>
 
       <div class="space-y-4">
@@ -135,13 +165,20 @@ const deleteEvent = async (id: string) => {
           </div>
         </div>
 
-        <button 
-          @click="addEvent" 
+        <button
+          @click="addEvent"
           :disabled="saving"
           class="w-full bg-red-600 text-white font-bold py-3 rounded-lg hover:bg-red-700 transition disabled:bg-gray-300 flex items-center justify-center gap-2"
         >
           <Loader2 v-if="saving" class="w-4 h-4 animate-spin" />
-          บันทึกกิจกรรมบังคับ
+          {{ editingEventId ? 'บันทึกการแก้ไข' : 'บันทึกกิจกรรมบังคับ' }}
+        </button>
+        <button
+          v-if="editingEventId"
+          @click="cancelEditEvent"
+          class="w-full text-gray-500 text-sm font-bold py-2 rounded-lg hover:bg-gray-100 transition flex items-center justify-center gap-1"
+        >
+          <X class="w-3.5 h-3.5" /> ยกเลิกการแก้ไข
         </button>
       </div>
     </div>
@@ -162,7 +199,7 @@ const deleteEvent = async (id: string) => {
             </tr>
           </thead>
           <tbody class="divide-y divide-gray-100">
-            <tr v-for="e in events" :key="e.id" class="hover:bg-red-50">
+            <tr v-for="e in events" :key="e.id" :class="['hover:bg-red-50', editingEventId === e.id ? 'bg-yellow-50' : '']">
               <td class="px-4 py-4 font-bold text-red-700">
                 {{ days.find(d => d.val === e.day_of_week)?.name }} คาบ {{ e.period_number }}
               </td>
@@ -181,7 +218,10 @@ const deleteEvent = async (id: string) => {
                   </span>
                 </div>
               </td>
-              <td class="px-4 py-4 text-center">
+              <td class="px-4 py-4 text-center whitespace-nowrap">
+                <button @click="startEditEvent(e)" class="text-gray-400 hover:text-blue-600 transition mr-2">
+                  <Pencil class="w-4 h-4" />
+                </button>
                 <button @click="deleteEvent(e.id)" class="text-gray-400 hover:text-red-600 transition">
                   <Trash2 class="w-4 h-4" />
                 </button>

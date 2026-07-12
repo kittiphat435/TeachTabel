@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { ref, onMounted, computed } from 'vue'
 import axios from 'axios'
-import { LayoutDashboard, Users, BookOpen, Home, CheckCircle2, AlertCircle, Loader2 } from 'lucide-vue-next'
+import { LayoutDashboard, Users, BookOpen, Home, CheckCircle2, AlertCircle, Loader2, Info, Zap, Trash2, AlertTriangle } from 'lucide-vue-next'
 
 const API_BASE = 'http://localhost:8000'
 
@@ -15,6 +15,11 @@ const stats = ref({
 
 const teacherWorkload = ref<any[]>([])
 const loading = ref(true)
+
+const solving = ref(false)
+const clearing = ref(false)
+const solveResult = ref<any>(null)
+const solveError = ref('')
 
 const fetchData = async () => {
   loading.value = true
@@ -50,6 +55,40 @@ const fetchData = async () => {
 }
 
 onMounted(fetchData)
+
+const runSolver = async () => {
+  solving.value = true
+  solveError.value = ''
+  solveResult.value = null
+  try {
+    const res = await axios.post(`${API_BASE}/solve/`, {})
+    solveResult.value = res.data
+  } catch (e: any) {
+    if (e?.response?.status === 403) {
+      solveError.value = 'เฉพาะผู้ดูแลระบบ (admin) เท่านั้นที่เริ่มประมวลผลจัดตารางได้'
+    } else if (e?.response?.status === 401) {
+      solveError.value = 'กรุณาเข้าสู่ระบบก่อนใช้งาน'
+    } else {
+      solveError.value = e?.response?.data?.detail || 'เกิดข้อผิดพลาดในการประมวลผล'
+    }
+  } finally {
+    solving.value = false
+  }
+}
+
+const clearAutoSchedule = async () => {
+  if (!confirm('ลบตารางที่ระบบจัดอัตโนมัติทั้งหมด (ตารางที่จัดด้วยมือจะไม่ถูกลบ)?')) return
+  clearing.value = true
+  try {
+    await axios.delete(`${API_BASE}/schedule/auto`)
+    solveResult.value = null
+    alert('ล้างตารางอัตโนมัติสำเร็จ')
+  } catch (e: any) {
+    alert(e?.response?.status === 403 ? 'เฉพาะผู้ดูแลระบบเท่านั้น' : 'ลบไม่สำเร็จ')
+  } finally {
+    clearing.value = false
+  }
+}
 </script>
 
 <template>
@@ -127,13 +166,52 @@ onMounted(fetchData)
         
         <div class="mt-8 p-4 bg-blue-50 border border-blue-100 rounded-lg">
           <p class="text-sm text-blue-800 font-medium mb-1">พร้อมเข้าสู่ Flow 3?</p>
-          <p class="text-xs text-blue-600 mb-3">เมื่อตรวจสอบข้อมูลครบถ้วนแล้ว คุณสามารถกดปุ่ม "ประมวลผลจัดตาราง" เพื่อให้อัลกอริทึมเริ่มทำงาน</p>
-          <button 
-            :disabled="stats.assignments === 0"
-            class="bg-blue-600 text-white px-4 py-2 rounded-md text-sm font-bold hover:bg-blue-700 transition disabled:bg-gray-300"
-          >
-            เริ่มประมวลผลจัดตาราง (AI Solver)
-          </button>
+          <p class="text-xs text-blue-600 mb-3">เมื่อตรวจสอบข้อมูลครบถ้วนแล้ว คุณสามารถกดปุ่ม "ประมวลผลจัดตาราง" เพื่อให้อัลกอริทึมเริ่มทำงาน รายการที่จัดไม่ลงจะปล่อยว่างไว้ให้ไปจัดต่อเองที่หน้า Manual Scheduling</p>
+          <div class="flex gap-2">
+            <button
+              @click="runSolver"
+              :disabled="stats.assignments === 0 || solving"
+              class="bg-blue-600 text-white px-4 py-2 rounded-md text-sm font-bold hover:bg-blue-700 transition disabled:bg-gray-300 flex items-center gap-2"
+            >
+              <Loader2 v-if="solving" class="w-4 h-4 animate-spin" />
+              <Zap v-else class="w-4 h-4" />
+              เริ่มประมวลผลจัดตาราง (Auto Solver)
+            </button>
+            <button
+              @click="clearAutoSchedule"
+              :disabled="clearing"
+              class="bg-white border border-gray-300 text-gray-600 px-3 py-2 rounded-md text-sm font-bold hover:bg-gray-50 transition disabled:opacity-50 flex items-center gap-2"
+              title="ล้างเฉพาะตารางที่จัดอัตโนมัติ (ตารางที่จัดด้วยมือจะไม่ถูกลบ)"
+            >
+              <Loader2 v-if="clearing" class="w-4 h-4 animate-spin" />
+              <Trash2 v-else class="w-4 h-4" />
+            </button>
+          </div>
+
+          <div v-if="solveError" class="mt-3 p-3 bg-red-50 border border-red-200 rounded-lg text-xs text-red-700 flex items-center gap-1">
+            <AlertTriangle class="w-4 h-4 shrink-0" /> {{ solveError }}
+          </div>
+
+          <div v-if="solveResult" class="mt-3 p-3 bg-white border border-blue-200 rounded-lg space-y-2">
+            <p class="text-sm font-bold text-gray-800 flex items-center gap-1">
+              <CheckCircle2 class="w-4 h-4 text-green-500" />
+              จัดสำเร็จ {{ solveResult.placed_count }} / {{ solveResult.total }} รายการ
+            </p>
+
+            <div v-if="solveResult.warnings?.length" class="text-xs text-orange-600 space-y-1">
+              <p class="font-bold flex items-center gap-1"><AlertTriangle class="w-3 h-3" /> คำเตือน ({{ solveResult.warnings.length }})</p>
+              <ul class="list-disc list-inside">
+                <li v-for="(w, i) in solveResult.warnings" :key="i">{{ w }}</li>
+              </ul>
+            </div>
+
+            <div v-if="solveResult.unplaced?.length" class="text-xs text-red-600 space-y-1">
+              <p class="font-bold flex items-center gap-1"><AlertCircle class="w-3 h-3" /> จัดไม่ลง ({{ solveResult.unplaced.length }}) — ต้องจัดด้วยมือ</p>
+              <ul class="list-disc list-inside">
+                <li v-for="(u, i) in solveResult.unplaced" :key="i">{{ u.subject_name }} — {{ u.reason }}</li>
+              </ul>
+            </div>
+          </div>
         </div>
       </div>
 

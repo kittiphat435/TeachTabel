@@ -11,7 +11,8 @@
   "dependencies": {
     "vue": "^3.4.21",
     "axios": "^1.6.7",
-    "lucide-vue-next": "^0.344.0"
+    "lucide-vue-next": "^0.344.0",
+    "firebase": "^12.16.0"
   },
   "devDependencies": {
     "@vitejs/plugin-vue": "^5.0.4",
