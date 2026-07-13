@@ -29,7 +29,6 @@ const selectedClassrooms = ref<string[]>([])
 const selectedRoomIds = ref<string[]>([])
 const totalPeriods = ref(2)
 const selectedSplitPattern = ref<number[]>([2])
-const isScout = ref(false)
 const editingAssignmentId = ref<string | null>(null)
 
 // Search States
@@ -123,7 +122,6 @@ const resetForm = () => {
   selectedRoomIds.value = []
   totalPeriods.value = 2
   selectedSplitPattern.value = [2]
-  isScout.value = false
   editingAssignmentId.value = null
 }
 
@@ -140,8 +138,7 @@ const saveAssignment = async () => {
     classroom_ids: selectedClassrooms.value,
     room_ids: selectedRoomIds.value,
     total_periods: totalPeriods.value,
-    period_split: selectedSplitPattern.value,
-    is_scout: isScout.value
+    period_split: selectedSplitPattern.value
   }
   try {
     if (editingAssignmentId.value) {
@@ -166,7 +163,6 @@ const startEditAssignment = async (a: any) => {
   selectedTeachers.value = [...(a.teacher_ids || [])]
   selectedClassrooms.value = [...(a.classroom_ids || [])]
   selectedRoomIds.value = [...(a.room_ids || [])]
-  isScout.value = !!a.is_scout
   totalPeriods.value = a.total_periods
   await nextTick() // รอ watch(totalPeriods) รีเซ็ต selectedSplitPattern ก่อน แล้วค่อยตั้งค่าที่ถูกต้องทับ
   const match = availablePatterns.value.find(p => JSON.stringify(p) === JSON.stringify(a.period_split))
@@ -237,7 +233,6 @@ const deleteAssignment = async (id: string) => {
                 <span v-if="t.teacher_code" class="text-gray-400 font-mono">[{{ t.teacher_code }}]</span>
                 {{ t.full_name }}
               </label>
-              <span class="text-[9px] text-gray-400 font-medium uppercase">{{ t.department }}</span>
             </div>
             <div v-if="filteredTeachers.length === 0" class="text-center py-4 text-xs text-gray-400">ไม่พบรายชื่อครู</div>
           </div>
@@ -294,14 +289,6 @@ const deleteAssignment = async (id: string) => {
               <option v-for="(p, i) in availablePatterns" :key="i" :value="p">{{ p.join(' + ') }}</option>
             </select>
           </div>
-        </div>
-
-        <!-- Scout Flag -->
-        <div class="flex items-center gap-2 p-3 bg-yellow-50 rounded-lg border border-yellow-200">
-          <input type="checkbox" id="is-scout" v-model="isScout" class="rounded text-yellow-600 w-4 h-4">
-          <label for="is-scout" class="text-xs font-bold text-yellow-800 cursor-pointer flex items-center gap-1">
-            <Flag class="w-3 h-3" /> วิชาลูกเสือ / เนตรนารี / ยุวกาชาด
-          </label>
         </div>
 
         <button
