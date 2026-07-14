@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { ref, onMounted, computed } from 'vue'
 import axios from 'axios'
-import { LayoutDashboard, Users, BookOpen, Home, CheckCircle2, AlertCircle, Loader2, Info, Zap, Trash2, AlertTriangle } from 'lucide-vue-next'
+import { LayoutDashboard, Users, BookOpen, Home, CheckCircle2, AlertCircle, Loader2, Info, Zap, Trash2, AlertTriangle, ChevronUp, ChevronDown } from 'lucide-vue-next'
 
 const API_BASE = 'http://localhost:8000'
 
@@ -20,6 +20,66 @@ const solving = ref(false)
 const clearing = ref(false)
 const solveResult = ref<any>(null)
 const solveError = ref('')
+
+// --- จัดตารางแบบทีละขั้น + เลือกลำดับขั้นตอนได้ ---
+const ORDER_STORAGE_KEY = 'teachtabel_solve_order'
+const defaultOrder = ['double', 'coteach', 'single']
+const savedOrder = (() => {
+  try {
+    const raw = localStorage.getItem(ORDER_STORAGE_KEY)
+    const parsed = raw ? JSON.parse(raw) : null
+    if (Array.isArray(parsed) && [...parsed].sort().join() === [...defaultOrder].sort().join()) return parsed
+  } catch { /* ignore */ }
+  return [...defaultOrder]
+})()
+const order = ref<string[]>(savedOrder)
+const categoryCounts = ref<Record<string, { label: string; count: number }>>({})
+const loadingPreview = ref(false)
+const stepResults = ref<Record<number, any>>({})
+const solvingStep = ref<number | null>(null)
+
+const fetchPreview = async () => {
+  loadingPreview.value = true
+  try {
+    const res = await axios.get(`${API_BASE}/solve/preview`, { params: { order: order.value.join(',') } })
+    const counts: Record<string, { label: string; count: number }> = {}
+    for (const s of res.data.steps || []) counts[s.category] = { label: s.label, count: s.count }
+    categoryCounts.value = counts
+  } catch (e) {
+    console.error('preview error', e)
+  } finally {
+    loadingPreview.value = false
+  }
+}
+
+const moveStep = (idx: number, dir: -1 | 1) => {
+  const newIdx = idx + dir
+  if (newIdx < 0 || newIdx >= order.value.length) return
+  const arr = [...order.value]
+  ;[arr[idx], arr[newIdx]] = [arr[newIdx], arr[idx]]
+  order.value = arr
+  localStorage.setItem(ORDER_STORAGE_KEY, JSON.stringify(arr))
+  stepResults.value = {} // ลำดับเปลี่ยนแล้ว ผลลัพธ์เดิมอาจอ้างอิงขั้นที่ตำแหน่งไม่ตรงกันอีกต่อไป
+}
+
+const runStep = async (stepIdx: number) => {
+  solvingStep.value = stepIdx
+  solveError.value = ''
+  try {
+    const res = await axios.post(`${API_BASE}/solve/`, { phase: stepIdx, order: order.value })
+    stepResults.value = { ...stepResults.value, [stepIdx]: res.data }
+  } catch (e: any) {
+    if (e?.response?.status === 403) {
+      solveError.value = 'เฉพาะผู้ดูแลระบบ (admin) เท่านั้นที่เริ่มประมวลผลจัดตารางได้'
+    } else if (e?.response?.status === 401) {
+      solveError.value = 'กรุณาเข้าสู่ระบบก่อนใช้งาน'
+    } else {
+      solveError.value = e?.response?.data?.detail || 'เกิดข้อผิดพลาดในการประมวลผล'
+    }
+  } finally {
+    solvingStep.value = null
+  }
+}
 
 const fetchData = async () => {
   loading.value = true
@@ -40,11 +100,13 @@ const fetchData = async () => {
     }
 
     // คำนวณภาระงานครูแบบง่าย (ในอนาคตควรดึงจากตารางเชื่อมโยง assignment_teachers)
-    // สำหรับ Prototype นี้เราแสดงเป็นภาพรวมก่อน
-    teacherWorkload.value = tRes.data.slice(0, 5).map((t: any) => ({
+    // สำหรับ Prototype นี้เราแสดงเป็นภาพรวมก่อน — เอาครูที่สอนติดกันเกิน 2 คาบขึ้นก่อนให้เห็นทันที
+    const sortedTeachers = [...tRes.data].sort((a: any, b: any) => (b.consecutive_overload ? 1 : 0) - (a.consecutive_overload ? 1 : 0))
+    teacherWorkload.value = sortedTeachers.slice(0, 5).map((t: any) => ({
         name: t.full_name,
         dept: t.department,
-        status: 'พร้อมจัดตาราง'
+        status: t.consecutive_overload ? 'สอนติดกันเกิน 2 คาบ' : 'พร้อมจัดตาราง',
+        overload: !!t.consecutive_overload
     }))
 
   } catch (error) {
@@ -54,14 +116,15 @@ const fetchData = async () => {
   }
 }
 
-onMounted(fetchData)
+onMounted(() => { fetchData(); fetchPreview() })
 
 const runSolver = async () => {
   solving.value = true
   solveError.value = ''
   solveResult.value = null
+  stepResults.value = {}
   try {
-    const res = await axios.post(`${API_BASE}/solve/`, {})
+    const res = await axios.post(`${API_BASE}/solve/`, { order: order.value })
     solveResult.value = res.data
   } catch (e: any) {
     if (e?.response?.status === 403) {
@@ -82,6 +145,7 @@ const clearAutoSchedule = async () => {
   try {
     await axios.delete(`${API_BASE}/schedule/auto`)
     solveResult.value = null
+    stepResults.value = {}
     alert('ล้างตารางอัตโนมัติสำเร็จ')
   } catch (e: any) {
     alert(e?.response?.status === 403 ? 'เฉพาะผู้ดูแลระบบเท่านั้น' : 'ลบไม่สำเร็จ')
@@ -165,17 +229,66 @@ const clearAutoSchedule = async () => {
         </ul>
         
         <div class="mt-8 p-4 bg-blue-50 border border-blue-100 rounded-lg">
-          <p class="text-sm text-blue-800 font-medium mb-1">พร้อมเข้าสู่ Flow 3?</p>
-          <p class="text-xs text-blue-600 mb-3">เมื่อตรวจสอบข้อมูลครบถ้วนแล้ว คุณสามารถกดปุ่ม "ประมวลผลจัดตาราง" เพื่อให้อัลกอริทึมเริ่มทำงาน รายการที่จัดไม่ลงจะปล่อยว่างไว้ให้ไปจัดต่อเองที่หน้า Manual Scheduling</p>
+          <p class="text-sm text-blue-800 font-medium mb-1">ลำดับขั้นตอนจัดตาราง (เลือกได้)</p>
+          <p class="text-xs text-blue-600 mb-3">
+            ระบบแบ่งภาระงานเป็น 3 กลุ่ม ใช้ลูกศรจัดลำดับก่อน-หลังตามที่ต้องการ แล้วกด "เริ่มขั้นนี้" ทีละขั้นเพื่อตรวจผลก่อนไปขั้นถัดไป
+            หรือกด "จัดทั้งหมดตามลำดับนี้" เพื่อจัดรวดเดียวตามลำดับที่ตั้งไว้ รายการที่จัดไม่ลงจะปล่อยว่างไว้ให้ไปจัดต่อเองที่หน้า Manual Scheduling
+          </p>
+
+          <div class="space-y-2 mb-3">
+            <div v-for="(cat, idx) in order" :key="cat" class="flex items-center gap-2 bg-white border border-blue-200 rounded-md p-2">
+              <div class="flex flex-col shrink-0">
+                <button @click="moveStep(idx, -1)" :disabled="idx === 0" class="text-gray-400 hover:text-blue-600 disabled:opacity-20 transition">
+                  <ChevronUp class="w-4 h-4" />
+                </button>
+                <button @click="moveStep(idx, 1)" :disabled="idx === order.length - 1" class="text-gray-400 hover:text-blue-600 disabled:opacity-20 transition">
+                  <ChevronDown class="w-4 h-4" />
+                </button>
+              </div>
+              <span class="w-6 h-6 shrink-0 flex items-center justify-center bg-blue-600 text-white text-xs font-bold rounded-full">{{ idx + 1 }}</span>
+              <div class="flex-1 min-w-0">
+                <p class="text-sm font-bold text-gray-800 truncate">{{ categoryCounts[cat]?.label || cat }}</p>
+                <p class="text-xs text-gray-500">{{ loadingPreview ? '...' : (categoryCounts[cat]?.count ?? 0) }} รายการ</p>
+              </div>
+              <button
+                @click="runStep(idx + 1)"
+                :disabled="!categoryCounts[cat]?.count || solvingStep !== null || solving"
+                class="shrink-0 bg-blue-600 text-white px-3 py-1.5 rounded-md text-xs font-bold hover:bg-blue-700 transition disabled:bg-gray-300 flex items-center gap-1"
+              >
+                <Loader2 v-if="solvingStep === idx + 1" class="w-3 h-3 animate-spin" />
+                เริ่มขั้นนี้
+              </button>
+            </div>
+          </div>
+
+          <div v-for="(res, stepNum) in stepResults" :key="'res-' + stepNum" class="mb-2 p-3 bg-white border border-blue-200 rounded-lg space-y-1">
+            <p class="text-xs font-bold text-gray-800 flex items-center gap-1">
+              <CheckCircle2 class="w-3.5 h-3.5 text-green-500" />
+              {{ res.phase_label }}: จัดสำเร็จ {{ res.placed_count }} / {{ res.total }} รายการ
+            </p>
+            <div v-if="res.warnings?.length" class="text-xs text-orange-600 space-y-1">
+              <p class="font-bold flex items-center gap-1"><AlertTriangle class="w-3 h-3" /> คำเตือน ({{ res.warnings.length }})</p>
+              <ul class="list-disc list-inside">
+                <li v-for="(w, i) in res.warnings" :key="i">{{ w }}</li>
+              </ul>
+            </div>
+            <div v-if="res.unplaced?.length" class="text-xs text-red-600 space-y-1">
+              <p class="font-bold flex items-center gap-1"><AlertCircle class="w-3 h-3" /> จัดไม่ลง ({{ res.unplaced.length }}) — ต้องจัดด้วยมือ</p>
+              <ul class="list-disc list-inside">
+                <li v-for="(u, i) in res.unplaced" :key="i">{{ u.subject_name }} — {{ u.reason }}</li>
+              </ul>
+            </div>
+          </div>
+
           <div class="flex gap-2">
             <button
               @click="runSolver"
-              :disabled="stats.assignments === 0 || solving"
+              :disabled="stats.assignments === 0 || solving || solvingStep !== null"
               class="bg-blue-600 text-white px-4 py-2 rounded-md text-sm font-bold hover:bg-blue-700 transition disabled:bg-gray-300 flex items-center gap-2"
             >
               <Loader2 v-if="solving" class="w-4 h-4 animate-spin" />
               <Zap v-else class="w-4 h-4" />
-              เริ่มประมวลผลจัดตาราง (Auto Solver)
+              จัดทั้งหมดตามลำดับนี้ (รวดเดียว)
             </button>
             <button
               @click="clearAutoSchedule"
@@ -195,7 +308,7 @@ const clearAutoSchedule = async () => {
           <div v-if="solveResult" class="mt-3 p-3 bg-white border border-blue-200 rounded-lg space-y-2">
             <p class="text-sm font-bold text-gray-800 flex items-center gap-1">
               <CheckCircle2 class="w-4 h-4 text-green-500" />
-              จัดสำเร็จ {{ solveResult.placed_count }} / {{ solveResult.total }} รายการ
+              จัดสำเร็จ {{ solveResult.placed_count }} / {{ solveResult.total }} รายการ (ทุกขั้นรวมกัน)
             </p>
 
             <div v-if="solveResult.warnings?.length" class="text-xs text-orange-600 space-y-1">
@@ -221,10 +334,13 @@ const clearAutoSchedule = async () => {
         <div class="space-y-3">
           <div v-for="t in teacherWorkload" :key="t.name" class="flex items-center justify-between p-3 bg-gray-50 rounded-md border border-gray-100">
             <div>
-              <p class="text-sm font-bold text-gray-800">{{ t.name }}</p>
+              <p class="text-sm font-bold text-gray-800 flex items-center gap-1">
+                <AlertTriangle v-if="t.overload" class="w-3.5 h-3.5 text-red-500 shrink-0" />
+                {{ t.name }}
+              </p>
               <p class="text-xs text-gray-500">{{ t.dept }}</p>
             </div>
-            <span class="text-[10px] bg-green-100 text-green-700 px-2 py-0.5 rounded-full font-bold uppercase">{{ t.status }}</span>
+            <span :class="['text-[10px] px-2 py-0.5 rounded-full font-bold uppercase', t.overload ? 'bg-red-100 text-red-700' : 'bg-green-100 text-green-700']">{{ t.status }}</span>
           </div>
           <p v-if="teacherWorkload.length === 0" class="text-center py-8 text-gray-400 italic text-sm">ไม่มีข้อมูลครูในระบบ</p>
         </div>

@@ -141,7 +141,7 @@ const deleteEvent = async (id: string) => {
           </div>
           <div>
             <label class="block text-xs font-bold text-gray-500 mb-1 uppercase">3. คาบที่</label>
-            <input type="number" v-model="selectedPeriod" min="1" max="8" class="w-full border rounded-md p-2 text-sm">
+            <input type="number" v-model="selectedPeriod" min="1" max="11" class="w-full border rounded-md p-2 text-sm">
           </div>
         </div>
 

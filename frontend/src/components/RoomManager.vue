@@ -1,14 +1,22 @@
 <script setup lang="ts">
 import { ref, computed, onMounted } from 'vue'
 import axios from 'axios'
-import { Home, School, Plus, BookOpen, Users, Upload, Loader2, AlertCircle, Trash2, Pencil, Search, Check, X } from 'lucide-vue-next'
+import { Home, School, Plus, BookOpen, Users, Upload, Loader2, AlertCircle, AlertTriangle, Trash2, Pencil, Search, Check, X } from 'lucide-vue-next'
 
 const API_BASE = 'http://localhost:8000'
 
 interface Classroom { id?: string; grade_level: string; room_name: string; lunch_period?: number }
 interface Room { id?: string; room_name: string; room_type: string; home_classroom_id?: string | null; home_classroom_label?: string | null }
 interface Subject { id?: string; subject_code: string; subject_name: string }
-interface Teacher { id?: string; full_name: string; department: string; teacher_code?: string | null }
+interface Teacher { id?: string; full_name: string; department: string; teacher_code?: string | null; consecutive_overload?: boolean; consecutive_overload_detail?: { day: number; start: number; end: number; run: number }[] }
+
+const DAY_NAMES: Record<number, string> = { 1: 'จันทร์', 2: 'อังคาร', 3: 'พุธ', 4: 'พฤหัสบดี', 5: 'ศุกร์' }
+const overloadTitle = (t: Teacher) => {
+  if (!t.consecutive_overload_detail?.length) return ''
+  return 'สอนติดกันเกิน 2 คาบ: ' + t.consecutive_overload_detail
+    .map(d => `วัน${DAY_NAMES[d.day] || d.day} คาบ ${d.start}-${d.end} (${d.run} คาบติด)`)
+    .join(', ')
+}
 
 const classrooms = ref<Classroom[]>([])
 const rooms = ref<Room[]>([])
@@ -419,7 +427,12 @@ onMounted(fetchData)
                 <template v-else>
                   <td class="p-2 border-b text-center text-gray-400 text-xs">{{ i + 1 }}</td>
                   <td class="p-2 border-b text-gray-400 text-xs">{{ t.teacher_code || '-' }}</td>
-                  <td class="p-2 border-b font-medium text-xs">{{ t.full_name }}</td>
+                  <td class="p-2 border-b font-medium text-xs">
+                    <span v-if="t.consecutive_overload" :title="overloadTitle(t)" class="inline-flex items-center gap-0.5 text-red-500 mr-1">
+                      <AlertTriangle class="w-3.5 h-3.5 inline" />
+                    </span>
+                    {{ t.full_name }}
+                  </td>
                   <td class="p-2 border-b text-gray-500 text-xs">{{ t.department || '-' }}</td>
                   <td class="p-2 border-b text-center whitespace-nowrap">
                     <button @click="startEdit('teachers', t)" class="text-gray-300 hover:text-blue-600 mr-1"><Pencil class="w-3.5 h-3.5 inline" /></button>

@@ -1,5 +1,6 @@
 import os
 import re
+from datetime import datetime
 import pandas as pd
 from fastapi import FastAPI, HTTPException, UploadFile, File, Depends, Form
 from fastapi.middleware.cors import CORSMiddleware
@@ -121,8 +122,8 @@ def _normalize_room_type(raw: Optional[str]) -> str:
         return "ห้องประจำชั้น"
     return "ห้องปฏิบัติการ"
 
-def _check_schedule_conflicts(day_of_week: int, period_number: int, teacher_ids: List[str], classroom_ids: List[str], room_id: Optional[str], exclude_entry_id: Optional[str] = None, year_key: Optional[str] = None) -> List[str]:
-    """ตรวจสอบครูสอนซ้ำ / ชั้นเรียนซ้ำ / ห้องซ้ำ / ครูติดล็อกเวลา / ติดกิจกรรมส่วนรวม ในคาบเดียวกัน (เฉพาะปี/เทอมเดียวกัน)"""
+def _check_schedule_conflicts(day_of_week: int, period_number: int, teacher_ids: List[str], classroom_ids: List[str], room_id: Optional[str], exclude_entry_id: Optional[str] = None, year_key: Optional[str] = None, plan_id: Optional[str] = None) -> List[str]:
+    """ตรวจสอบครูสอนซ้ำ / ชั้นเรียนซ้ำ / ห้องซ้ำ / ครูติดล็อกเวลา / ติดกิจกรรมส่วนรวม ในคาบเดียวกัน (เฉพาะปี/เทอม/แผนเดียวกัน — ล็อกเวลาครู/กิจกรรมบังคับใช้ร่วมกันทุกแผน)"""
     conflicts: List[str] = []
     teacher_ids_set = set(teacher_ids)
     classroom_ids_set = set(classroom_ids)
@@ -135,6 +136,8 @@ def _check_schedule_conflicts(day_of_week: int, period_number: int, teacher_ids:
             continue
         data = doc.to_dict()
         if year_key and data.get("year_key") != year_key:
+            continue
+        if plan_id and data.get("plan_id") != plan_id:
             continue
         if teacher_ids_set & set(data.get("teacher_ids", [])):
             conflicts.append("มีครูอย่างน้อย 1 ท่านสอนคาบนี้อยู่แล้ว")
@@ -173,6 +176,8 @@ class Teacher(BaseModel):
     full_name: str
     department: str
     teacher_code: Optional[str] = None
+    consecutive_overload: Optional[bool] = False
+    consecutive_overload_detail: Optional[List[dict]] = []
 
 class Subject(BaseModel):
     id: Optional[str] = None
@@ -204,6 +209,15 @@ class UnavailabilityUpdate(BaseModel):
     period_number: int
     reason: Optional[str] = "ไม่ว่าง"
 
+class PlanCreate(BaseModel):
+    label: str
+    # ถ้าระบุ = คัดลอกภาระงานสอน (assignments) และตารางสอนที่จัดไว้แล้ว (schedule_entries) จากแผนต้นทางนี้มาเป็นจุดเริ่มต้น
+    # ถ้าไม่ระบุ (None) และเป็นแผนแรกของปีนี้ = โอนภาระงาน/ตารางสอนเดิมที่ยังไม่มี plan_id เข้าแผนนี้ (ข้อมูลก่อนมีระบบแผน)
+    duplicate_from: Optional[str] = None
+
+class PlanLabelUpdate(BaseModel):
+    label: str
+
 class AssignmentCreate(BaseModel):
     subject_id: str
     teacher_ids: List[str]
@@ -214,6 +228,9 @@ class AssignmentCreate(BaseModel):
     # รายชื่อ "ห้องปฏิบัติการ" ที่ครูวิชานี้สอนได้ (เลือกได้หลายห้อง) — ตอนจัดตารางอัตโนมัติ ระบบจะเลือกห้องที่ว่างจากรายการนี้ให้เอง
     # ถ้าปล่อยว่าง = สอนที่ห้องเรียนประจำของนักเรียนเอง ไม่ต้องจองห้องแยก
     room_ids: List[str] = []
+    # เลือก "ห้องประจำ" เป็นตัวเลือกได้ชัดเจน (ไม่ต้องเลือกเบอร์ห้อง เพราะผูกไว้แล้วในตารางห้อง)
+    # ถ้าเลือกไว้คู่กับห้องปฏิบัติการ ระบบจะใช้ห้องประจำเป็นทางเลือกสำรองถ้าห้องปฏิบัติการที่เลือกไว้ไม่ว่างทุกห้อง
+    include_home_room: Optional[bool] = False
     is_scout: Optional[bool] = False
 
 class FixedEventCreate(BaseModel):
@@ -479,8 +496,102 @@ async def delete_fixed_event(event_id: str, user: dict = Depends(get_current_use
         return {"status": "success"}
     except Exception as e: raise HTTPException(status_code=500, detail=str(e))
 
+# --- Plan APIs (แผนภาระงานสอน) ---
+# "แผน" ใช้แยกภาระงานสอน (assignments) และตารางสอนที่จัดไว้แล้ว (schedule_entries) ออกจากกันหลายเวอร์ชันภายในปี/เทอมเดียวกัน
+# เช่น กรณีครูเกษียณ/ลาออก จำนวนครูในกลุ่มสาระเปลี่ยน ก็สร้างแผนใหม่มาลองจัดสรรภาระงานใหม่ได้โดยไม่ทับแผนเดิม
+# ครู/วิชา/ห้องเรียน/ห้อง/ล็อกเวลาครู/กิจกรรมบังคับ/ลำดับความสำคัญกลุ่มสาระ ยังคงใช้ชุดเดียวกันร่วมกันทุกแผน (ผูกกับ year_key เหมือนเดิม)
+
+@app.get("/plans/")
+async def list_plans(year_key: Optional[str] = None):
+    if not db: raise HTTPException(status_code=500, detail="Firestore not initialized")
+    if not year_key:
+        return []
+    try:
+        docs = list(db.collection("plans").where("year_key", "==", year_key).stream())
+        if not docs:
+            # ยังไม่เคยมีแผนสำหรับปีนี้เลย — สร้าง "แผน 1" ให้อัตโนมัติ แล้วโอนภาระงาน/ตารางสอนเดิม
+            # (ที่สร้างไว้ก่อนมีระบบแผน ยังไม่มี plan_id) เข้าแผนนี้ ให้ใช้งานต่อได้ทันทีไม่มีของหาย
+            _, doc_ref = db.collection("plans").add({
+                "label": "แผน 1",
+                "year_key": year_key,
+                "created_at": datetime.utcnow().isoformat(),
+            })
+            default_plan_id = doc_ref.id
+            for a_doc in db.collection("assignments").where("year_key", "==", year_key).stream():
+                if not a_doc.to_dict().get("plan_id"):
+                    a_doc.reference.update({"plan_id": default_plan_id})
+            for e_doc in db.collection("schedule_entries").where("year_key", "==", year_key).stream():
+                if not e_doc.to_dict().get("plan_id"):
+                    e_doc.reference.update({"plan_id": default_plan_id})
+            docs = list(db.collection("plans").where("year_key", "==", year_key).stream())
+        plans = [{"id": d.id, **d.to_dict()} for d in docs]
+        plans.sort(key=lambda p: p.get("created_at") or "")
+        return plans
+    except Exception as e: raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/plans/")
+async def create_plan(data: PlanCreate, year_key: Optional[str] = None, user: dict = Depends(get_current_user)):
+    if not db: raise HTTPException(status_code=500, detail="Firestore not initialized")
+    if not year_key:
+        raise HTTPException(status_code=400, detail="ต้องเลือกปีการศึกษาก่อนจึงจะสร้างแผนได้")
+    if not data.label.strip():
+        raise HTTPException(status_code=400, detail="กรุณาระบุชื่อแผน")
+    try:
+        _, doc_ref = db.collection("plans").add({
+            "label": data.label.strip(),
+            "year_key": year_key,
+            "created_at": datetime.utcnow().isoformat(),
+        })
+        plan_id = doc_ref.id
+
+        if data.duplicate_from:
+            # คัดลอกภาระงานสอน (+ ความสัมพันธ์ครู/ชั้นเรียน) จากแผนต้นทางมาเป็นจุดเริ่มต้นของแผนใหม่
+            for a_doc in db.collection("assignments").where("plan_id", "==", data.duplicate_from).stream():
+                a_data = a_doc.to_dict()
+                a_data["plan_id"] = plan_id
+                _, new_a_ref = db.collection("assignments").add(a_data)
+                new_a_id = new_a_ref.id
+                for rel in db.collection("assignment_teachers").where("assignment_id", "==", a_doc.id).stream():
+                    db.collection("assignment_teachers").add({"assignment_id": new_a_id, "teacher_id": rel.to_dict().get("teacher_id")})
+                for rel in db.collection("assignment_classrooms").where("assignment_id", "==", a_doc.id).stream():
+                    db.collection("assignment_classrooms").add({"assignment_id": new_a_id, "classroom_id": rel.to_dict().get("classroom_id")})
+            # คัดลอกตารางสอนที่จัดไว้แล้วของแผนต้นทางมาด้วย (ทั้ง manual และ auto)
+            for e_doc in db.collection("schedule_entries").where("plan_id", "==", data.duplicate_from).stream():
+                e_data = e_doc.to_dict()
+                e_data["plan_id"] = plan_id
+                db.collection("schedule_entries").add(e_data)
+
+        return {"status": "success", "plan_id": plan_id}
+    except Exception as e: raise HTTPException(status_code=500, detail=str(e))
+
+@app.put("/plans/{plan_id}")
+async def update_plan(plan_id: str, data: PlanLabelUpdate, user: dict = Depends(get_current_user)):
+    if not db: raise HTTPException(status_code=500, detail="Firestore not initialized")
+    if not data.label.strip():
+        raise HTTPException(status_code=400, detail="กรุณาระบุชื่อแผน")
+    try:
+        db.collection("plans").document(plan_id).update({"label": data.label.strip()})
+        return {"status": "success"}
+    except Exception as e: raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/plans/{plan_id}")
+async def delete_plan(plan_id: str, user: dict = Depends(get_current_user)):
+    if not db: raise HTTPException(status_code=500, detail="Firestore not initialized")
+    try:
+        db.collection("plans").document(plan_id).delete()
+        for a_doc in db.collection("assignments").where("plan_id", "==", plan_id).stream():
+            for rel in db.collection("assignment_teachers").where("assignment_id", "==", a_doc.id).stream():
+                rel.reference.delete()
+            for rel in db.collection("assignment_classrooms").where("assignment_id", "==", a_doc.id).stream():
+                rel.reference.delete()
+            a_doc.reference.delete()
+        for e_doc in db.collection("schedule_entries").where("plan_id", "==", plan_id).stream():
+            e_doc.reference.delete()
+        return {"status": "success"}
+    except Exception as e: raise HTTPException(status_code=500, detail=str(e))
+
 @app.get("/assignments/")
-async def get_assignments(year_key: Optional[str] = None):
+async def get_assignments(year_key: Optional[str] = None, plan_id: Optional[str] = None):
     if not db: raise HTTPException(status_code=500, detail="Firestore not initialized")
     try:
         teachers_map = {doc.id: doc.to_dict().get("full_name") for doc in db.collection("teachers").stream()}
@@ -489,9 +600,15 @@ async def get_assignments(year_key: Optional[str] = None):
         rooms_map = {doc.id: doc.to_dict().get("room_name") for doc in db.collection("rooms").stream()}
 
         assignments = []
-        assign_docs = db.collection("assignments").where("year_key", "==", year_key).stream() if year_key else db.collection("assignments").stream()
+        assign_query = db.collection("assignments")
+        if year_key:
+            assign_query = assign_query.where("year_key", "==", year_key)
+        assign_docs = assign_query.stream()
         for doc in assign_docs:
             data = doc.to_dict()
+            # กรองตามแผน — ถ้าระบุ plan_id มา ให้แสดงเฉพาะภาระงานของแผนนั้น (ข้อมูลเก่าที่ยังไม่มี plan_id จะถูกโอนเข้า "แผน 1" อัตโนมัติตอนเรียก GET /plans/ แล้ว)
+            if plan_id and data.get("plan_id") != plan_id:
+                continue
             a_id = doc.id
             t_names, t_ids = [], []
             t_rels = db.collection("assignment_teachers").where("assignment_id", "==", a_id).stream()
@@ -512,6 +629,7 @@ async def get_assignments(year_key: Optional[str] = None):
             room_names = [rooms_map[r] for r in room_ids if r in rooms_map]
             assignments.append({
                 "id": a_id,
+                "plan_id": data.get("plan_id"),
                 "subject_id": data.get("subject_id"),
                 "subject_name": subjects_map.get(data.get("subject_id"), "ไม่ทราบวิชา"),
                 "teacher_names": t_names,
@@ -522,13 +640,14 @@ async def get_assignments(year_key: Optional[str] = None):
                 "room_names": room_names,
                 "total_periods": data.get("total_periods"),
                 "period_split": data.get("period_split"),
-                "is_scout": data.get("is_scout", False)
+                "is_scout": data.get("is_scout", False),
+                "include_home_room": data.get("include_home_room", False)
             })
         return assignments
     except Exception as e: raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/assignments/")
-async def create_assignment(data: AssignmentCreate, year_key: Optional[str] = None, user: dict = Depends(get_current_user)):
+async def create_assignment(data: AssignmentCreate, year_key: Optional[str] = None, plan_id: Optional[str] = None, user: dict = Depends(get_current_user)):
     if not db: raise HTTPException(status_code=500, detail="Firestore not initialized")
     try:
         assignment_data = {
@@ -537,8 +656,10 @@ async def create_assignment(data: AssignmentCreate, year_key: Optional[str] = No
             "period_split": data.period_split,
             "term_id": data.term_id,
             "room_ids": data.room_ids or [],
+            "include_home_room": data.include_home_room or False,
             "is_scout": data.is_scout or False,
             "year_key": year_key,
+            "plan_id": plan_id,
         }
         _, doc_ref = db.collection("assignments").add(assignment_data)
         assignment_id = doc_ref.id
@@ -559,6 +680,7 @@ async def update_assignment(assignment_id: str, data: AssignmentCreate, user: di
             "period_split": data.period_split,
             "room_ids": data.room_ids or [],
             "room_id": firestore.DELETE_FIELD,  # เคลียร์ฟิลด์เก่าแบบเดี่ยวทิ้ง (ถ้ามี) หลังแก้ไขแล้วให้ใช้ room_ids เท่านั้น
+            "include_home_room": data.include_home_room or False,
             "is_scout": data.is_scout or False,
         })
         # ลบความสัมพันธ์เดิมแล้วสร้างใหม่ทั้งหมด
@@ -674,12 +796,19 @@ async def get_teacher_assignments(teacher_id: str):
     except Exception as e: raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/teachers/", response_model=List[Teacher])
-async def get_teachers(year_key: Optional[str] = None):
+async def get_teachers(year_key: Optional[str] = None, plan_id: Optional[str] = None, term_id: Optional[str] = None):
     if not db: raise HTTPException(status_code=500, detail="Firestore not initialized")
     docs = db.collection("teachers").where("year_key", "==", year_key).stream() if year_key else db.collection("teachers").stream()
     result = [{"id": doc.id, **{k: v for k, v in doc.to_dict().items() if k in ("full_name", "department", "teacher_code")}} for doc in docs]
     # เรียงตามรหัส ID ก่อน (ถ้ามี) ไม่มีรหัสให้ไปอยู่ท้ายสุด เรียงตามชื่อแทน
     result.sort(key=lambda t: (0, _natural_key(t.get("teacher_code"))) if t.get("teacher_code") else (1, _natural_key(t.get("full_name"))))
+
+    # ทำเครื่องหมายครูที่ตารางสอนปัจจุบันมีคาบสอนติดกันเกิน 2 คาบ (หาช่องว่างลงไม่ได้ตอนจัดอัตโนมัติ หรือจัดด้วยมือชนกัน)
+    overloaded = _teachers_with_consecutive_overload(term_id, year_key, plan_id)
+    for t in result:
+        detail = overloaded.get(t["id"])
+        t["consecutive_overload"] = bool(detail)
+        t["consecutive_overload_detail"] = detail or []
     return result
 
 @app.get("/subjects/", response_model=List[Subject])
@@ -897,7 +1026,7 @@ async def update_user_role(uid: str, data: RoleUpdate, admin: dict = Depends(req
 # --- Manual Schedule (จัดตารางสอนแบบ manual ทีละคาบ) ---
 
 @app.get("/schedule/")
-async def get_schedule_entries(classroom_id: Optional[str] = None, teacher_id: Optional[str] = None, term_id: Optional[str] = None, year_key: Optional[str] = None):
+async def get_schedule_entries(classroom_id: Optional[str] = None, teacher_id: Optional[str] = None, room_id: Optional[str] = None, term_id: Optional[str] = None, year_key: Optional[str] = None, plan_id: Optional[str] = None):
     if not db: raise HTTPException(status_code=500, detail="Firestore not initialized")
     try:
         subjects_map = {doc.id: f"{doc.to_dict().get('subject_code')} {doc.to_dict().get('subject_name')}" for doc in db.collection("subjects").stream()}
@@ -916,8 +1045,10 @@ async def get_schedule_entries(classroom_id: Optional[str] = None, teacher_id: O
         for doc in db.collection("schedule_entries").stream():
             data = doc.to_dict()
             if year_key and data.get("year_key") != year_key: continue
+            if plan_id and data.get("plan_id") != plan_id: continue
             if classroom_id and classroom_id not in data.get("classroom_ids", []): continue
             if teacher_id and teacher_id not in data.get("teacher_ids", []): continue
+            if room_id and data.get("room_id") != room_id: continue
             if term_id and data.get("term_id") != term_id: continue
             entry_classroom_ids = data.get("classroom_ids", [])
             explicit_room_id = data.get("room_id")
@@ -948,13 +1079,13 @@ async def get_schedule_entries(classroom_id: Optional[str] = None, teacher_id: O
     except Exception as e: raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/schedule/")
-async def create_schedule_entry(data: ScheduleEntryCreate, year_key: Optional[str] = None, user: dict = Depends(get_current_user)):
+async def create_schedule_entry(data: ScheduleEntryCreate, year_key: Optional[str] = None, plan_id: Optional[str] = None, user: dict = Depends(get_current_user)):
     if not db: raise HTTPException(status_code=500, detail="Firestore not initialized")
     # ต้องระบุอย่างน้อยฝั่งใดฝั่งหนึ่ง (ครู หรือ ชั้นเรียน) — รองรับกรณี "ชุมนุม (อิสระ)" ที่บันทึกฝั่งห้องเรียน
     # กับฝั่งครูแยกจากกัน โดยไม่ต้องผูกกัน
     if not data.teacher_ids and not data.classroom_ids:
         raise HTTPException(status_code=400, detail="ต้องระบุครูผู้สอนหรือชั้นเรียนอย่างน้อยหนึ่งอย่าง")
-    conflicts = _check_schedule_conflicts(data.day_of_week, data.period_number, data.teacher_ids, data.classroom_ids, data.room_id, year_key=year_key)
+    conflicts = _check_schedule_conflicts(data.day_of_week, data.period_number, data.teacher_ids, data.classroom_ids, data.room_id, year_key=year_key, plan_id=plan_id)
     if conflicts:
         raise HTTPException(status_code=409, detail={"message": "พบตารางซ้ำซ้อนในคาบนี้", "conflicts": conflicts})
     try:
@@ -963,6 +1094,7 @@ async def create_schedule_entry(data: ScheduleEntryCreate, year_key: Optional[st
         entry_data["created_by_name"] = user.get("name") or user.get("email")
         entry_data["source"] = "manual"
         entry_data["year_key"] = year_key
+        entry_data["plan_id"] = plan_id
         _, doc_ref = db.collection("schedule_entries").add(entry_data)
         return {"status": "success", "id": doc_ref.id}
     except Exception as e: raise HTTPException(status_code=500, detail=str(e))
@@ -976,14 +1108,16 @@ async def delete_schedule_entry(entry_id: str, user: dict = Depends(get_current_
     except Exception as e: raise HTTPException(status_code=500, detail=str(e))
 
 @app.delete("/schedule/auto")
-async def clear_auto_schedule(term_id: Optional[str] = None, year_key: Optional[str] = None, admin: dict = Depends(require_admin)):
-    """ลบเฉพาะตารางที่ระบบ Auto Solver จัดไว้ (source == 'auto') ไม่แตะตารางที่ admin/ครูจัดด้วยมือ (เฉพาะปี/เทอมปัจจุบัน)"""
+async def clear_auto_schedule(term_id: Optional[str] = None, year_key: Optional[str] = None, plan_id: Optional[str] = None, admin: dict = Depends(require_admin)):
+    """ลบเฉพาะตารางที่ระบบ Auto Solver จัดไว้ (source == 'auto') ไม่แตะตารางที่ admin/ครูจัดด้วยมือ (เฉพาะปี/เทอม/แผนปัจจุบัน)"""
     if not db: raise HTTPException(status_code=500, detail="Firestore not initialized")
     try:
         deleted = 0
         for doc in db.collection("schedule_entries").where("source", "==", "auto").stream():
             d = doc.to_dict()
             if year_key and d.get("year_key") != year_key:
+                continue
+            if plan_id and d.get("plan_id") != plan_id:
                 continue
             if term_id and d.get("term_id") and d.get("term_id") != term_id:
                 continue
@@ -1034,9 +1168,10 @@ async def set_department_priority(data: DepartmentPriorityUpdate, year_key: Opti
 # รายการที่จัดไม่ลงจะถูกปล่อยว่างไว้ (ไม่ทำให้ทั้งรอบ fail) ให้ admin ไปจัดต่อเองผ่านหน้า "จัดตารางสอน Manual"
 
 DAYS = [1, 2, 3, 4, 5]
-PERIODS = list(range(1, 9))
+DAY_NAMES = {1: "จันทร์", 2: "อังคาร", 3: "พุธ", 4: "พฤหัสบดี", 5: "ศุกร์"}
+PERIODS = list(range(1, 12))
 
-def _load_solver_data(term_id: Optional[str], year_key: Optional[str] = None):
+def _load_solver_data(term_id: Optional[str], year_key: Optional[str] = None, plan_id: Optional[str] = None):
     teacher_docs = db.collection("teachers").where("year_key", "==", year_key).stream() if year_key else db.collection("teachers").stream()
     teachers = {d.id: d.to_dict() for d in teacher_docs}
     subject_docs = db.collection("subjects").where("year_key", "==", year_key).stream() if year_key else db.collection("subjects").stream()
@@ -1049,6 +1184,8 @@ def _load_solver_data(term_id: Optional[str], year_key: Optional[str] = None):
     for doc in assignment_docs:
         data = doc.to_dict()
         if term_id and data.get("term_id") and data.get("term_id") != term_id:
+            continue
+        if plan_id and data.get("plan_id") != plan_id:
             continue
         a_id = doc.id
         t_ids = [r.to_dict().get("teacher_id") for r in db.collection("assignment_teachers").where("assignment_id", "==", a_id).stream()]
@@ -1065,6 +1202,7 @@ def _load_solver_data(term_id: Optional[str], year_key: Optional[str] = None):
             "teacher_ids": t_ids,
             "classroom_ids": c_ids,
             "room_ids": room_ids,
+            "include_home_room": bool(data.get("include_home_room", False)),
             "total_periods": data.get("total_periods", 1),
             "period_split": data.get("period_split") or [data.get("total_periods", 1)],
             "is_scout": bool(data.get("is_scout", False)),
@@ -1095,12 +1233,14 @@ def _blocked_from_fixed_and_unavailable(year_key: Optional[str] = None):
 
     return blocked_teacher_slots, blocked_classroom_slots
 
-def _load_occupied(term_id: Optional[str], year_key: Optional[str] = None):
+def _load_occupied(term_id: Optional[str], year_key: Optional[str] = None, plan_id: Optional[str] = None):
     """โหลดคาบที่ถูกจองไปแล้วใน schedule_entries (ทั้ง manual และ auto ของรอบก่อน) เป็นจุดตั้งต้น"""
     occupied = {}
     for doc in db.collection("schedule_entries").stream():
         d = doc.to_dict()
         if year_key and d.get("year_key") != year_key:
+            continue
+        if plan_id and d.get("plan_id") != plan_id:
             continue
         if term_id and d.get("term_id") and d.get("term_id") != term_id:
             continue
@@ -1114,11 +1254,13 @@ def _load_occupied(term_id: Optional[str], year_key: Optional[str] = None):
             slot["subj_by_class"].setdefault(c, set()).add(d.get("subject_id"))
     return occupied
 
-def _load_teacher_day_periods(term_id: Optional[str], year_key: Optional[str] = None):
+def _load_teacher_day_periods(term_id: Optional[str], year_key: Optional[str] = None, plan_id: Optional[str] = None):
     result = {}
     for doc in db.collection("schedule_entries").stream():
         d = doc.to_dict()
         if year_key and d.get("year_key") != year_key:
+            continue
+        if plan_id and d.get("plan_id") != plan_id:
             continue
         if term_id and d.get("term_id") and d.get("term_id") != term_id:
             continue
@@ -1126,6 +1268,24 @@ def _load_teacher_day_periods(term_id: Optional[str], year_key: Optional[str] = 
             key = (t, d.get("day_of_week"))
             result.setdefault(key, []).append(d.get("period_number"))
     return result
+
+def _teachers_with_consecutive_overload(term_id: Optional[str] = None, year_key: Optional[str] = None, plan_id: Optional[str] = None, limit: int = 2):
+    """สแกนตารางสอนปัจจุบันทั้งหมด (ทั้งที่จัดอัตโนมัติและจัดด้วยมือ) หาว่าครูคนไหนต้องสอนติดกันเกิน `limit` คาบในวันเดียว
+    คืนค่า {teacher_id: [{"day": วัน, "start": คาบเริ่ม, "end": คาบจบ, "run": จำนวนคาบติดกัน}, ...]}"""
+    tdp = _load_teacher_day_periods(term_id, year_key, plan_id)
+    overloaded: dict = {}
+    for (tid, day), periods in tdp.items():
+        periods = sorted(set(p for p in periods if p is not None))
+        i = 0
+        while i < len(periods):
+            j = i
+            while j + 1 < len(periods) and periods[j + 1] == periods[j] + 1:
+                j += 1
+            run_len = j - i + 1
+            if run_len > limit:
+                overloaded.setdefault(tid, []).append({"day": day, "start": periods[i], "end": periods[j], "run": run_len})
+            i = j + 1
+    return overloaded
 
 def _would_exceed_consecutive(teacher_day_periods, teacher_id, day, period, limit=2):
     periods = sorted(teacher_day_periods.get((teacher_id, day), []) + [period])
@@ -1183,7 +1343,8 @@ def _slot_is_free(occupied, blocked_teacher_slots, blocked_classroom_slots, clas
             if set(a["classroom_ids"]) & slot["classrooms"]:
                 return False
     # เช็คว่ามีห้องปฏิบัติการว่างให้เลือกอย่างน้อย 1 ห้อง (ถ้าวิชานี้ระบุตัวเลือกห้องไว้)
-    if a.get("room_ids") and _pick_available_room(occupied, day, period_range, a["room_ids"]) is False:
+    # ถ้าติ๊ก "ห้องประจำ" ไว้ด้วย ต่อให้ห้องปฏิบัติการที่เลือกไว้ไม่ว่างเลย ก็ยังใช้ห้องประจำแทนได้ ไม่ถือว่าคาบนี้ไม่ว่าง
+    if a.get("room_ids") and not a.get("include_home_room") and _pick_available_room(occupied, day, period_range, a["room_ids"]) is False:
         return False
     return True
 
@@ -1195,41 +1356,97 @@ def _department_priority_order(year_key: Optional[str] = None):
 def _dept_sort_key(dept, priority_order):
     return priority_order.index(dept) if dept in priority_order else len(priority_order)
 
-def run_auto_solver(term_id: Optional[str] = None, year_key: Optional[str] = None):
-    teachers, subjects, classrooms, assignments = _load_solver_data(term_id, year_key)
-    priority_order = _department_priority_order(year_key)
+DEFAULT_ORDER = ["double", "coteach", "single"]
+CATEGORY_LABELS = {
+    "double": "วิชาคาบคู่ (ไม่สอนร่วม)",
+    "coteach": "วิชาสอนร่วมหลายครู/ลูกเสือ",
+    "single": "วิชาคาบเดี่ยวที่เหลือ",
+}
 
-    # เคลียร์ผลลัพธ์ auto รอบก่อนหน้าทิ้งก่อน (ไม่แตะของที่จัดด้วยมือ) แล้วค่อยจัดใหม่
-    for doc in db.collection("schedule_entries").where("source", "==", "auto").stream():
-        d = doc.to_dict()
-        if year_key and d.get("year_key") != year_key:
-            continue
-        if term_id and d.get("term_id") and d.get("term_id") != term_id:
-            continue
-        doc.reference.delete()
-
-    blocked_teacher_slots, blocked_classroom_slots = _blocked_from_fixed_and_unavailable(year_key)
-    occupied = _load_occupied(term_id, year_key)
-    teacher_day_periods = _load_teacher_day_periods(term_id, year_key)
-
+def _split_phases(assignments, teachers, priority_order):
+    """แบ่งภาระงานออกเป็น 3 หมวดตามความยากในการจัด — ไม่ได้กำหนดลำดับตายตัว
+    ผู้ใช้เลือกลำดับที่จะให้ solver จัดจริงได้เองจากหน้าเว็บ (พารามิเตอร์ `order`):
+    double  = คาบคู่ที่ครูสอนคนเดียว (ต้องการคาบว่างติดกัน มักจัดง่ายกว่าตอนตารางว่างเยอะ)
+    coteach = วิชาที่มีครูสอนร่วมกันหลายคน (นัดครูหลายคนพร้อมกันยากสุด) รวมถึงลูกเสือ/ชุมนุม
+    single  = คาบเดี่ยวที่เหลือ (ยืดหยุ่นที่สุด)"""
     def is_double(a):
         return any(x >= 2 for x in a["period_split"])
 
     def is_coteach(a):
         return len(a["teacher_ids"]) > 1
 
-    phase1 = [a for a in assignments if is_double(a) and not is_coteach(a)]
-    phase1.sort(key=lambda a: _dept_sort_key(teachers.get(a["teacher_ids"][0], {}).get("department"), priority_order))
+    double = [a for a in assignments if is_double(a) and not is_coteach(a)]
+    double.sort(key=lambda a: _dept_sort_key(teachers.get(a["teacher_ids"][0], {}).get("department"), priority_order))
 
-    phase2 = (
+    coteach = (
         [a for a in assignments if is_coteach(a) and a["is_scout"]]
         + [a for a in assignments if is_coteach(a) and not a["is_scout"] and is_double(a)]
         + [a for a in assignments if is_coteach(a) and not a["is_scout"] and not is_double(a)]
     )
 
-    phase3 = [a for a in assignments if not is_coteach(a) and not is_double(a)]
+    single = [a for a in assignments if not is_coteach(a) and not is_double(a)]
+    return {"double": double, "coteach": coteach, "single": single}
 
-    queue = phase1 + phase2 + phase3
+def _parse_order(order_param) -> list:
+    """รับ order เป็น list หรือ string คั่นด้วย comma แล้วตรวจว่าเป็น permutation ของหมวดที่ถูกต้อง
+    ถ้าไม่ถูกต้อง (ค่าว่าง/พิมพ์ผิด/ไม่ครบ) จะ fallback กลับไปใช้ลำดับเดิม (double, coteach, single)"""
+    if not order_param:
+        return list(DEFAULT_ORDER)
+    if isinstance(order_param, str):
+        keys = [k.strip() for k in order_param.split(",") if k.strip()]
+    else:
+        keys = list(order_param)
+    if sorted(keys) == sorted(DEFAULT_ORDER):
+        return keys
+    return list(DEFAULT_ORDER)
+
+def run_auto_solver(term_id: Optional[str] = None, year_key: Optional[str] = None, plan_id: Optional[str] = None, phase: Optional[int] = None, order: Optional[list] = None, category: Optional[str] = None, department: Optional[str] = None):
+    """phase=None จัดทุกหมวดตามลำดับ order รวดเดียว (แบบเดิม), phase=1/2/3 จัดเฉพาะหมวดที่อยู่ตำแหน่งนั้นของ order
+    เพื่อให้ผู้ใช้ตรวจสอบผลลัพธ์ทีละขั้นก่อนไปขั้นถัดไปได้ — แต่ละขั้นจัดซ้ำได้โดยไม่กระทบขั้นอื่น
+    เพราะจะลบเฉพาะผลลัพธ์ auto เดิมของภาระงานในขั้นตอนนั้นๆ เท่านั้นก่อนจัดใหม่
+    `order` = ลำดับหมวดที่ผู้ใช้เลือกจากหน้าเว็บ เช่น ["coteach","double","single"] — ค่าเริ่มต้นคือลำดับเดิม
+    `category` = ระบุหมวดตรงๆ ("double"/"coteach"/"single") แทนการอ้างอิงตำแหน่งผ่าน phase (ใช้จากหน้าลำดับความสำคัญกลุ่มสาระ)
+    `department` = จัดเฉพาะภาระงานของกลุ่มสาระนี้เท่านั้น (กรองจากกลุ่มสาระของครูคนแรกในภาระงาน) — ให้กดจัดทีละกลุ่มสาระได้"""
+    order = _parse_order(order)
+    teachers, subjects, classrooms, assignments = _load_solver_data(term_id, year_key, plan_id)
+    priority_order = _department_priority_order(year_key)
+
+    categories = _split_phases(assignments, teachers, priority_order)
+    ordered = [(k, categories.get(k, [])) for k in order]
+
+    category_key = None
+    if category in categories:
+        category_key = category
+        queue = categories[category]
+    elif phase in (1, 2, 3):
+        category_key, queue = ordered[phase - 1]
+    else:
+        queue = [a for _, lst in ordered for a in lst]
+
+    if department:
+        queue = [a for a in queue if any(teachers.get(t, {}).get("department") == department for t in a["teacher_ids"])]
+
+    # เคลียร์ผลลัพธ์ auto เดิมทิ้งก่อนแล้วค่อยจัดใหม่ — ถ้าจัดแบบระบุขอบเขต (phase/category/department) จะลบเฉพาะของภาระงานในขอบเขตนั้น (กันชนส่วนอื่น)
+    # ถ้าไม่ระบุขอบเขตเลย (จัดรวดเดียวทั้งหมด) จะลบของทั้งหมดเหมือนเดิม ไม่แตะของที่จัดด้วยมือ
+    is_scoped = phase is not None or category is not None or department is not None
+    queue_assignment_ids = {a["id"] for a in queue} if is_scoped else None
+    for doc in db.collection("schedule_entries").where("source", "==", "auto").stream():
+        d = doc.to_dict()
+        if year_key and d.get("year_key") != year_key:
+            continue
+        if plan_id and d.get("plan_id") != plan_id:
+            continue
+        if term_id and d.get("term_id") and d.get("term_id") != term_id:
+            continue
+        if queue_assignment_ids is not None and d.get("assignment_id") not in queue_assignment_ids:
+            continue
+        doc.reference.delete()
+
+    # โหลดสถานะคาบที่ถูกจองไปแล้วใหม่เสมอ (รวมผลลัพธ์จากขั้นตอนก่อนหน้าที่จัดไปแล้วในรอบนี้ด้วย)
+    blocked_teacher_slots, blocked_classroom_slots = _blocked_from_fixed_and_unavailable(year_key)
+    occupied = _load_occupied(term_id, year_key, plan_id)
+    teacher_day_periods = _load_teacher_day_periods(term_id, year_key, plan_id)
+
     placed, unplaced, warnings = [], [], []
 
     for a in queue:
@@ -1266,15 +1483,24 @@ def run_auto_solver(term_id: Optional[str] = None, year_key: Optional[str] = Non
 
             day, period_range, exceeds = best_slot
             if exceeds:
+                teacher_names = ", ".join(
+                    teachers.get(t, {}).get("full_name", "?") for t in a["teacher_ids"]
+                )
+                day_name = DAY_NAMES.get(day, str(day))
                 warnings.append(
-                    f"{subjects.get(a['subject_id'], {}).get('subject_name', '?')}: ครูอาจต้องสอนติดกันเกิน 2 คาบ (วัน {day} คาบ {period_range[0]}-{period_range[-1]})"
+                    f"⚠ {teacher_names} ลงตารางเกิน 2 คาบติด — {subjects.get(a['subject_id'], {}).get('subject_name', '?')} "
+                    f"(วัน{day_name} คาบ {period_range[0]}-{period_range[-1]}) หาช่องว่างอื่นให้ไม่ได้"
                 )
             # เลือกห้องปฏิบัติการที่ว่างตลอดทั้ง block (ห้องเดียวกันทุกคาบในคาบคู่) จากตัวเลือกที่ครูวิชานี้เลือกไว้
             chosen_room_id = _pick_available_room(occupied, day, period_range, a.get("room_ids") or [])
             if chosen_room_id is False:
-                # ไม่ควรเกิดเพราะ _slot_is_free เช็คไปแล้ว แต่กันไว้เผื่อสภาวะแข่งกันของ block อื่นในลูปเดียวกัน
-                success = False
-                break
+                if a.get("include_home_room"):
+                    # ห้องปฏิบัติการที่เลือกไว้ไม่ว่างเลยสักห้อง แต่ติ๊ก "ห้องประจำ" ไว้ด้วย จึงใช้ห้องประจำของนักเรียนแทน
+                    chosen_room_id = None
+                else:
+                    # ไม่ควรเกิดเพราะ _slot_is_free เช็คไปแล้ว แต่กันไว้เผื่อสภาวะแข่งกันของ block อื่นในลูปเดียวกัน
+                    success = False
+                    break
             for p in period_range:
                 entry_data = {
                     "term_id": a["term_id"],
@@ -1289,6 +1515,7 @@ def run_auto_solver(term_id: Optional[str] = None, year_key: Optional[str] = Non
                     "source": "auto",
                     "created_by_name": "ระบบจัดตารางอัตโนมัติ",
                     "year_key": year_key,
+                    "plan_id": plan_id,
                 }
                 _, doc_ref = db.collection("schedule_entries").add(entry_data)
                 entry_ids_this_assignment.append(doc_ref.id)
@@ -1315,23 +1542,57 @@ def run_auto_solver(term_id: Optional[str] = None, year_key: Optional[str] = Non
                 "reason": "หาคาบว่างที่ไม่ชนกันไม่ได้ ต้องจัดด้วยมือผ่านหน้า 'จัดตารางสอน Manual'",
             })
 
+    if category_key and department:
+        phase_label = f"{CATEGORY_LABELS[category_key]} — กลุ่มสาระ{department}"
+    elif category_key and phase:
+        phase_label = f"ขั้นที่ {phase}: {CATEGORY_LABELS[category_key]}"
+    elif category_key:
+        phase_label = CATEGORY_LABELS[category_key]
+    elif department:
+        phase_label = f"กลุ่มสาระ{department}"
+    else:
+        phase_label = None
+
     return {
         "placed_count": len(placed),
         "total": len(queue),
         "unplaced": unplaced,
         "warnings": warnings,
+        "phase": phase,
+        "phase_label": phase_label,
+        "category": category_key,
+        "department": department,
+        "order": order,
     }
 
 class SolveRequest(BaseModel):
     term_id: Optional[str] = None
+    phase: Optional[int] = None
+    order: Optional[List[str]] = None
+    category: Optional[str] = None
+    department: Optional[str] = None
 
 @app.post("/solve/")
-async def solve_schedule(data: SolveRequest, year_key: Optional[str] = None, admin: dict = Depends(require_admin)):
+async def solve_schedule(data: SolveRequest, year_key: Optional[str] = None, plan_id: Optional[str] = None, admin: dict = Depends(require_admin)):
     if not db: raise HTTPException(status_code=500, detail="Firestore not initialized")
     try:
-        return run_auto_solver(data.term_id, year_key)
+        return run_auto_solver(data.term_id, year_key, plan_id, phase=data.phase, order=data.order, category=data.category, department=data.department)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/solve/preview")
+async def preview_solve(year_key: Optional[str] = None, plan_id: Optional[str] = None, term_id: Optional[str] = None, order: Optional[str] = None, admin: dict = Depends(require_admin)):
+    """คืนจำนวนภาระงานในแต่ละหมวด ตามลำดับ order ที่ผู้ใช้เลือกไว้ (ยังไม่จัดจริง) ให้หน้าเว็บแสดงก่อนกดเริ่ม"""
+    if not db: raise HTTPException(status_code=500, detail="Firestore not initialized")
+    teachers, subjects, classrooms, assignments = _load_solver_data(term_id, year_key, plan_id)
+    priority_order = _department_priority_order(year_key)
+    categories = _split_phases(assignments, teachers, priority_order)
+    order_list = _parse_order(order)
+    steps = [
+        {"step": i + 1, "category": k, "label": CATEGORY_LABELS[k], "count": len(categories.get(k, []))}
+        for i, k in enumerate(order_list)
+    ]
+    return {"order": order_list, "steps": steps, "total": len(assignments)}
 
 # --- IMPORT APIs (รองรับทั้ง .csv และ .xlsx) ---
 

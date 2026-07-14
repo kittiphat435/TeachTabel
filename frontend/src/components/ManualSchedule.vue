@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { ref, onMounted, computed, watch } from 'vue'
 import axios from 'axios'
-import { CalendarDays, Loader2, Trash2, AlertTriangle, CheckCircle2, Users, MapPin, BookOpen, Info, Search, Pencil, X } from 'lucide-vue-next'
+import { CalendarDays, Loader2, Trash2, AlertTriangle, CheckCircle2, Users, MapPin, BookOpen, Info, Search, Pencil, X, Home } from 'lucide-vue-next'
 import SearchableSelect from './SearchableSelect.vue'
 
 const API_BASE = 'http://localhost:8000'
@@ -45,7 +45,7 @@ const days = [
   { val: 4, name: 'พฤหัสบดี' },
   { val: 5, name: 'ศุกร์' },
 ]
-const periods = [1, 2, 3, 4, 5, 6, 7, 8]
+const periods = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
 
 // Form state
 const selectedClassroomId = ref('')
@@ -77,6 +77,68 @@ const classroomOptions = computed(() =>
 const subjectOptions = computed(() =>
   subjects.value.map(s => ({ value: s.id, label: `${s.subject_code} - ${s.subject_name}` }))
 )
+
+// --- มุมมองภาพรวมตาราง: ห้องเรียน (นักเรียน, แก้ไขได้) / ครู (ค้นหา, ดูอย่างเดียว) / ห้อง-สถานที่ (ค้นหา, ดูอย่างเดียว) ---
+const overviewMode = ref<'classroom' | 'teacher' | 'room'>('classroom')
+const overviewTeacherId = ref('')
+const overviewRoomId = ref('')
+const teacherOverviewEntries = ref<ScheduleEntry[]>([])
+const roomOverviewEntries = ref<ScheduleEntry[]>([])
+const loadingOverview = ref(false)
+
+const teacherOptions = computed(() =>
+  teachers.value.map(t => ({ value: t.id, label: t.teacher_code ? `[${t.teacher_code}] ${t.full_name}` : t.full_name }))
+)
+const roomOptions = computed(() =>
+  rooms.value.map(r => ({ value: r.id, label: r.room_name }))
+)
+
+const fetchTeacherOverview = async () => {
+  if (!overviewTeacherId.value) { teacherOverviewEntries.value = []; return }
+  loadingOverview.value = true
+  try {
+    const res = await axios.get(`${API_BASE}/schedule/`, { params: { teacher_id: overviewTeacherId.value } })
+    teacherOverviewEntries.value = res.data
+  } catch (e) {
+    console.error(e)
+  } finally {
+    loadingOverview.value = false
+  }
+}
+const fetchRoomOverview = async () => {
+  if (!overviewRoomId.value) { roomOverviewEntries.value = []; return }
+  loadingOverview.value = true
+  try {
+    const res = await axios.get(`${API_BASE}/schedule/`, { params: { room_id: overviewRoomId.value } })
+    roomOverviewEntries.value = res.data
+  } catch (e) {
+    console.error(e)
+  } finally {
+    loadingOverview.value = false
+  }
+}
+watch(overviewTeacherId, fetchTeacherOverview)
+watch(overviewRoomId, fetchRoomOverview)
+
+// ตารางที่ใช้แสดงในกริดขวา สลับตามมุมมองที่เลือก
+const activeEntries = computed(() => {
+  if (overviewMode.value === 'teacher') return teacherOverviewEntries.value
+  if (overviewMode.value === 'room') return roomOverviewEntries.value
+  return entries.value
+})
+const activeEntryAt = (day: number, period: number) =>
+  activeEntries.value.find(e => e.day_of_week === day && e.period_number === period)
+
+// บรรทัดรองในแต่ละช่องของตาราง ปรับเนื้อหาตามมุมมอง
+const cellSubtitle = (entry: ScheduleEntry) => {
+  if (overviewMode.value === 'teacher') {
+    return entry.classroom_names.length ? entry.classroom_names.join(', ') : 'ชุมนุม/ลูกเสือ (อิสระ)'
+  }
+  if (overviewMode.value === 'room') {
+    return [entry.classroom_names.join(', '), entry.teacher_names.join(', ')].filter(Boolean).join(' • ')
+  }
+  return entry.teacher_names.join(', ')
+}
 
 // ช่องค้นหาชื่อครู สำหรับ checkbox list (โหมดวิชาปกติ และโหมดชุมนุม/ลูกเสือ)
 const teacherSearch = ref('')
@@ -315,8 +377,6 @@ const deleteClubTeacherEntry = async (id: string) => {
   }
 }
 
-const entryAt = (day: number, period: number) =>
-  entries.value.find(e => e.day_of_week === day && e.period_number === period)
 </script>
 
 <template>
@@ -330,9 +390,34 @@ const entryAt = (day: number, period: number) =>
       <Loader2 class="w-10 h-10 animate-spin mx-auto mb-2" /> กำลังโหลดข้อมูล...
     </div>
 
-    <div v-else class="grid grid-cols-1 xl:grid-cols-3 gap-6">
-      <!-- Form -->
-      <div class="xl:col-span-1 bg-white p-6 rounded-xl shadow-sm border border-gray-200 h-fit sticky top-6 space-y-4">
+    <div v-else class="flex flex-wrap items-center gap-2 bg-white p-3 rounded-xl shadow-sm border border-gray-200">
+      <span class="text-xs font-bold text-gray-500 uppercase shrink-0">มุมมองตาราง:</span>
+      <button
+        @click="overviewMode = 'classroom'"
+        :class="overviewMode === 'classroom' ? 'bg-blue-600 text-white' : 'bg-gray-100 text-gray-600 hover:bg-gray-200'"
+        class="text-xs font-bold px-3 py-1.5 rounded-md transition-colors flex items-center gap-1"
+      >
+        <Home class="w-3.5 h-3.5" /> ตารางนักเรียน (ห้องเรียน) — แก้ไขได้
+      </button>
+      <button
+        @click="overviewMode = 'teacher'"
+        :class="overviewMode === 'teacher' ? 'bg-blue-600 text-white' : 'bg-gray-100 text-gray-600 hover:bg-gray-200'"
+        class="text-xs font-bold px-3 py-1.5 rounded-md transition-colors flex items-center gap-1"
+      >
+        <Users class="w-3.5 h-3.5" /> ตารางครู
+      </button>
+      <button
+        @click="overviewMode = 'room'"
+        :class="overviewMode === 'room' ? 'bg-blue-600 text-white' : 'bg-gray-100 text-gray-600 hover:bg-gray-200'"
+        class="text-xs font-bold px-3 py-1.5 rounded-md transition-colors flex items-center gap-1"
+      >
+        <MapPin class="w-3.5 h-3.5" /> ตารางห้อง/สถานที่
+      </button>
+    </div>
+
+    <div v-if="!loading" class="grid grid-cols-1 xl:grid-cols-3 gap-6">
+      <!-- Form (เฉพาะมุมมองห้องเรียน — ใช้แก้ไขตารางได้) -->
+      <div v-if="overviewMode === 'classroom'" class="xl:col-span-1 bg-white p-6 rounded-xl shadow-sm border border-gray-200 h-fit sticky top-6 space-y-4">
         <div>
           <label class="block text-xs font-bold text-gray-500 mb-1 uppercase">1. เลือกชั้นเรียน</label>
           <SearchableSelect v-model="selectedClassroomId" :options="classroomOptions" placeholder="ค้นหาห้องเรียน เช่น 1/1" />
@@ -531,48 +616,70 @@ const entryAt = (day: number, period: number) =>
         </div>
       </div>
 
-      <!-- Weekly grid (read view) -->
-      <div class="xl:col-span-2 bg-white p-6 rounded-xl shadow-sm border border-gray-200">
-        <div class="flex items-center justify-between mb-4">
+      <!-- Weekly grid -->
+      <div :class="overviewMode === 'classroom' ? 'xl:col-span-2' : 'xl:col-span-3'" class="bg-white p-6 rounded-xl shadow-sm border border-gray-200">
+        <div class="flex items-center justify-between mb-4 gap-3 flex-wrap">
           <h3 class="font-bold text-gray-700 flex items-center gap-2">
-            <BookOpen class="w-5 h-5 text-blue-600" />
-            ตารางสอนของชั้นเรียนที่เลือก
+            <BookOpen v-if="overviewMode === 'classroom'" class="w-5 h-5 text-blue-600" />
+            <Users v-else-if="overviewMode === 'teacher'" class="w-5 h-5 text-blue-600" />
+            <MapPin v-else class="w-5 h-5 text-blue-600" />
+            <span v-if="overviewMode === 'classroom'">ตารางสอนของชั้นเรียนที่เลือก</span>
+            <span v-else-if="overviewMode === 'teacher'">ตารางสอนของครู</span>
+            <span v-else>ตารางการใช้ห้อง/สถานที่</span>
           </h3>
-          <Loader2 v-if="loadingSchedule" class="w-4 h-4 animate-spin text-blue-500" />
+          <Loader2 v-if="loadingSchedule || loadingOverview" class="w-4 h-4 animate-spin text-blue-500" />
         </div>
 
-        <div class="overflow-x-auto">
-          <table class="min-w-full text-xs border-collapse">
-            <thead>
-              <tr>
-                <th class="p-2 border bg-gray-50 text-gray-500">คาบ</th>
-                <th v-for="d in days" :key="d.val" class="p-2 border bg-gray-50 text-gray-600 font-bold">{{ d.name }}</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr v-for="p in periods" :key="p">
-                <td class="p-2 border text-center font-bold text-gray-500 bg-gray-50">{{ p }}</td>
-                <td
-                  v-for="d in days"
-                  :key="d.val"
-                  @click="pickSlot(d.val, p)"
-                  :class="[
-                    'p-2 border cursor-pointer align-top min-w-[110px] transition-colors',
-                    selectedDay === d.val && selectedPeriod === p ? 'ring-2 ring-blue-500' : '',
-                    entryAt(d.val, p) ? 'bg-blue-50 hover:bg-blue-100' : 'hover:bg-gray-50'
-                  ]"
-                >
-                  <template v-if="entryAt(d.val, p)">
-                    <p class="font-bold text-blue-800 leading-tight">{{ entryAt(d.val, p)!.subject_name.split(' ')[0] }}</p>
-                    <p class="text-[10px] text-gray-500 truncate">{{ entryAt(d.val, p)!.teacher_names.join(', ') }}</p>
-                  </template>
-                  <span v-else class="text-gray-300">—</span>
-                </td>
-              </tr>
-            </tbody>
-          </table>
+        <div v-if="overviewMode === 'teacher'" class="mb-4 max-w-sm">
+          <label class="block text-xs font-bold text-gray-500 mb-1 uppercase">ค้นหาครู</label>
+          <SearchableSelect v-model="overviewTeacherId" :options="teacherOptions" placeholder="ค้นหาชื่อครู..." />
         </div>
-        <p class="text-[10px] text-gray-400 mt-3">คลิกที่ช่องในตารางเพื่อเลือกวัน/คาบในฟอร์มด้านซ้ายได้ทันที</p>
+        <div v-else-if="overviewMode === 'room'" class="mb-4 max-w-sm">
+          <label class="block text-xs font-bold text-gray-500 mb-1 uppercase">ค้นหาห้อง/สถานที่</label>
+          <SearchableSelect v-model="overviewRoomId" :options="roomOptions" placeholder="ค้นหาห้อง/สถานที่..." />
+        </div>
+
+        <div
+          v-if="(overviewMode === 'teacher' && !overviewTeacherId) || (overviewMode === 'room' && !overviewRoomId)"
+          class="text-center py-12 text-gray-400 italic text-sm"
+        >
+          เลือก{{ overviewMode === 'teacher' ? 'ครู' : 'ห้อง/สถานที่' }}ด้านบนเพื่อดูตาราง
+        </div>
+        <template v-else>
+          <div class="overflow-x-auto">
+            <table class="min-w-full text-xs border-collapse">
+              <thead>
+                <tr>
+                  <th class="p-2 border bg-gray-50 text-gray-500">คาบ</th>
+                  <th v-for="d in days" :key="d.val" class="p-2 border bg-gray-50 text-gray-600 font-bold">{{ d.name }}</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="p in periods" :key="p">
+                  <td class="p-2 border text-center font-bold text-gray-500 bg-gray-50">{{ p }}</td>
+                  <td
+                    v-for="d in days"
+                    :key="d.val"
+                    @click="overviewMode === 'classroom' ? pickSlot(d.val, p) : null"
+                    :class="[
+                      'p-2 border align-top min-w-[110px] transition-colors',
+                      overviewMode === 'classroom' ? 'cursor-pointer' : '',
+                      overviewMode === 'classroom' && selectedDay === d.val && selectedPeriod === p ? 'ring-2 ring-blue-500' : '',
+                      activeEntryAt(d.val, p) ? 'bg-blue-50 hover:bg-blue-100' : (overviewMode === 'classroom' ? 'hover:bg-gray-50' : '')
+                    ]"
+                  >
+                    <template v-if="activeEntryAt(d.val, p)">
+                      <p class="font-bold text-blue-800 leading-tight">{{ activeEntryAt(d.val, p)!.subject_name.split(' ')[0] }}</p>
+                      <p class="text-[10px] text-gray-500 truncate">{{ cellSubtitle(activeEntryAt(d.val, p)!) }}</p>
+                    </template>
+                    <span v-else class="text-gray-300">—</span>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <p v-if="overviewMode === 'classroom'" class="text-[10px] text-gray-400 mt-3">คลิกที่ช่องในตารางเพื่อเลือกวัน/คาบในฟอร์มด้านซ้ายได้ทันที</p>
+        </template>
       </div>
     </div>
   </div>

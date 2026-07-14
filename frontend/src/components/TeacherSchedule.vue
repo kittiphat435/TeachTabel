@@ -1,11 +1,19 @@
 <script setup lang="ts">
-import { ref, onMounted, watch } from 'vue'
+import { ref, onMounted, watch, computed } from 'vue'
 import axios from 'axios'
-import { UserCog, Loader2, MapPin, Home } from 'lucide-vue-next'
+import { UserCog, Loader2, MapPin, Home, AlertTriangle } from 'lucide-vue-next'
 
 const API_BASE = 'http://localhost:8000'
 
-interface Teacher { id: string; full_name: string; department: string; teacher_code?: string | null }
+interface Teacher { id: string; full_name: string; department: string; teacher_code?: string | null; consecutive_overload?: boolean; consecutive_overload_detail?: { day: number; start: number; end: number; run: number }[] }
+
+const DAY_NAMES: Record<number, string> = { 1: 'จันทร์', 2: 'อังคาร', 3: 'พุธ', 4: 'พฤหัสบดี', 5: 'ศุกร์' }
+const overloadTitle = (t: Teacher) => {
+  if (!t.consecutive_overload_detail?.length) return ''
+  return t.consecutive_overload_detail
+    .map(d => `วัน${DAY_NAMES[d.day] || d.day} คาบ ${d.start}-${d.end} (${d.run} คาบติด)`)
+    .join(', ')
+}
 interface ScheduleEntry {
   id: string
   day_of_week: number
@@ -30,7 +38,7 @@ const days = [
   { val: 4, name: 'พฤหัสบดี' },
   { val: 5, name: 'ศุกร์' },
 ]
-const periods = [1, 2, 3, 4, 5, 6, 7, 8]
+const periods = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
 
 const fetchTeachers = async () => {
   loading.value = true
@@ -71,6 +79,8 @@ watch(selectedTeacherId, fetchSchedule)
 
 const entryAt = (day: number, period: number) =>
   entries.value.find(e => e.day_of_week === day && e.period_number === period)
+
+const selectedTeacher = computed(() => teachers.value.find(t => t.id === selectedTeacherId.value))
 </script>
 
 <template>
@@ -92,8 +102,13 @@ const entryAt = (day: number, period: number) =>
       <div class="mb-4 max-w-xs">
         <label class="block text-xs font-bold text-gray-500 mb-1 uppercase">เลือกครู</label>
         <select v-model="selectedTeacherId" class="w-full border rounded-md p-2 text-sm">
-          <option v-for="t in teachers" :key="t.id" :value="t.id">{{ t.teacher_code ? `[${t.teacher_code}] ` : '' }}{{ t.full_name }} ({{ t.department }})</option>
+          <option v-for="t in teachers" :key="t.id" :value="t.id">{{ t.consecutive_overload ? '⚠ ' : '' }}{{ t.teacher_code ? `[${t.teacher_code}] ` : '' }}{{ t.full_name }} ({{ t.department }})</option>
         </select>
+      </div>
+
+      <div v-if="selectedTeacher?.consecutive_overload" class="mb-3 p-2 bg-red-50 border border-red-200 rounded-md text-xs text-red-700 flex items-start gap-1.5">
+        <AlertTriangle class="w-4 h-4 shrink-0 mt-0.5" />
+        <span><strong>{{ selectedTeacher.full_name }}</strong> ลงตารางเกิน 2 คาบติด — {{ overloadTitle(selectedTeacher) }}</span>
       </div>
 
       <div class="flex items-center justify-between mb-2">
