@@ -10,6 +10,14 @@ from typing import List, Optional
 import firebase_admin
 from firebase_admin import credentials, firestore, auth as fb_auth
 import io
+from xml.sax.saxutils import escape as _xml_escape
+from fastapi.responses import StreamingResponse
+from reportlab.lib.pagesizes import A4, landscape
+from reportlab.lib import colors
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, PageBreak
+from reportlab.lib.styles import ParagraphStyle
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
 
 app = FastAPI(title="TeachTabel API")
 
@@ -34,6 +42,16 @@ try:
 except Exception as e:
     print(f"Error initializing Firebase: {e}")
     db = None
+
+# ฟอนต์ไทย (Sarabun) สำหรับสร้าง PDF — ฝังไฟล์ฟอนต์ไว้ในโปรเจกต์เอง (backend/fonts/) เพราะฟอนต์ระบบทั่วไปไม่รองรับภาษาไทย
+try:
+    _FONT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts")
+    pdfmetrics.registerFont(TTFont("Sarabun", os.path.join(_FONT_DIR, "Sarabun-Regular.ttf")))
+    pdfmetrics.registerFont(TTFont("Sarabun-Bold", os.path.join(_FONT_DIR, "Sarabun-Bold.ttf")))
+    PDF_FONT_OK = True
+except Exception as e:
+    print(f"Error loading Thai font for PDF export: {e}")
+    PDF_FONT_OK = False
 
 # --- Auth (Firebase Google Sign-In) ---
 # Frontend เข้าสู่ระบบด้วย Firebase Auth (Google) แล้วแนบ ID token มาใน header
@@ -1099,6 +1117,31 @@ async def create_schedule_entry(data: ScheduleEntryCreate, year_key: Optional[st
         return {"status": "success", "id": doc_ref.id}
     except Exception as e: raise HTTPException(status_code=500, detail=str(e))
 
+@app.put("/schedule/{entry_id}")
+async def update_schedule_entry(entry_id: str, data: ScheduleEntryCreate, year_key: Optional[str] = None, plan_id: Optional[str] = None, user: dict = Depends(get_current_user)):
+    """แก้ไข/ย้ายคาบที่มีอยู่แล้วแบบอะตอมมิก (เขียนทับ document เดิม ไม่ลบแล้วสร้างใหม่)
+    เพื่อกันข้อมูลหายกรณีย้ายไปคาบที่ชนกันแล้วบันทึกไม่สำเร็จ — คาบเดิมจะไม่ถูกแตะต้องเลยถ้าพบว่าชนกัน
+    ใช้ exclude_entry_id กันไม่ให้คาบนี้ชนกับตัวเอง (กรณีแก้ไขรายละเอียดโดยไม่ย้ายวัน/คาบ)"""
+    if not db: raise HTTPException(status_code=500, detail="Firestore not initialized")
+    doc_ref = db.collection("schedule_entries").document(entry_id)
+    if not doc_ref.get().exists:
+        raise HTTPException(status_code=404, detail="ไม่พบตารางสอนคาบนี้")
+    if not data.teacher_ids and not data.classroom_ids:
+        raise HTTPException(status_code=400, detail="ต้องระบุครูผู้สอนหรือชั้นเรียนอย่างน้อยหนึ่งอย่าง")
+    conflicts = _check_schedule_conflicts(data.day_of_week, data.period_number, data.teacher_ids, data.classroom_ids, data.room_id, exclude_entry_id=entry_id, year_key=year_key, plan_id=plan_id)
+    if conflicts:
+        raise HTTPException(status_code=409, detail={"message": "พบตารางซ้ำซ้อนในคาบนี้", "conflicts": conflicts})
+    try:
+        entry_data = data.model_dump()
+        entry_data["created_by"] = user["uid"]
+        entry_data["created_by_name"] = user.get("name") or user.get("email")
+        entry_data["source"] = "manual"
+        entry_data["year_key"] = year_key
+        entry_data["plan_id"] = plan_id
+        doc_ref.set(entry_data)
+        return {"status": "success", "id": entry_id}
+    except Exception as e: raise HTTPException(status_code=500, detail=str(e))
+
 @app.delete("/schedule/{entry_id}")
 async def delete_schedule_entry(entry_id: str, user: dict = Depends(get_current_user)):
     if not db: raise HTTPException(status_code=500, detail="Firestore not initialized")
@@ -1593,6 +1636,224 @@ async def preview_solve(year_key: Optional[str] = None, plan_id: Optional[str] =
         for i, k in enumerate(order_list)
     ]
     return {"order": order_list, "steps": steps, "total": len(assignments)}
+
+# ============================================================
+# --- PDF EXPORT: ตารางครู / ตารางนักเรียน (ห้องเรียน) / ตารางห้อง-สถานที่ ---
+# รวมทุกคน/ทุกห้องเป็น PDF ไฟล์เดียว จัดหน้า A4 แนวนอน 6 ตาราง/หน้า (2 คอลัมน์ x 3 แถว)
+# ============================================================
+PDF_DAY_LABELS = {1: "จ.", 2: "อ.", 3: "พ.", 4: "พฤ.", 5: "ศ."}
+PDF_DAYS_ORDER = [1, 2, 3, 4, 5]
+PDF_PERIODS = list(range(1, 12))
+
+def _load_enriched_schedule_entries(year_key: Optional[str] = None, plan_id: Optional[str] = None, term_id: Optional[str] = None):
+    """คืนรายการคาบสอนทั้งหมด (ไม่กรองครู/ห้อง/ชั้นเรียน) พร้อมชื่อเต็มทุกอย่าง — ใช้เป็นฐานให้ PDF ทุกประเภทไปจัดกลุ่มเอง"""
+    subjects_map = {doc.id: f"{doc.to_dict().get('subject_code')} {doc.to_dict().get('subject_name')}" for doc in db.collection("subjects").stream()}
+    teachers_map = {doc.id: doc.to_dict().get("full_name") for doc in db.collection("teachers").stream()}
+    classrooms_map = {doc.id: f"{doc.to_dict().get('grade_level')}/{doc.to_dict().get('room_name')}" for doc in db.collection("classrooms").stream()}
+    rooms_map = {}
+    home_room_by_classroom = {}
+    for doc in db.collection("rooms").stream():
+        r_data = doc.to_dict()
+        rooms_map[doc.id] = r_data.get("room_name")
+        if r_data.get("home_classroom_id"):
+            home_room_by_classroom[r_data["home_classroom_id"]] = r_data.get("room_name")
+
+    results = []
+    for doc in db.collection("schedule_entries").stream():
+        data = doc.to_dict()
+        if year_key and data.get("year_key") != year_key: continue
+        if plan_id and data.get("plan_id") != plan_id: continue
+        if term_id and data.get("term_id") and data.get("term_id") != term_id: continue
+        classroom_ids = data.get("classroom_ids", [])
+        explicit_room_id = data.get("room_id")
+        fallback_room_name = None
+        if not explicit_room_id:
+            for c in classroom_ids:
+                if c in home_room_by_classroom:
+                    fallback_room_name = home_room_by_classroom[c]
+                    break
+        results.append({
+            "day_of_week": data.get("day_of_week"),
+            "period_number": data.get("period_number"),
+            "subject_name": subjects_map.get(data.get("subject_id"), "ไม่ทราบวิชา"),
+            "teacher_ids": data.get("teacher_ids", []),
+            "teacher_names": [teachers_map.get(t, "ไม่ทราบชื่อ") for t in data.get("teacher_ids", [])],
+            "classroom_ids": classroom_ids,
+            "classroom_names": [classrooms_map.get(c, "ไม่ทราบห้อง") for c in classroom_ids],
+            "room_id": explicit_room_id,
+            "room_name": rooms_map.get(explicit_room_id) if explicit_room_id else fallback_room_name,
+        })
+    return results
+
+def _pdf_shorten(text: str, max_len: int = 12) -> str:
+    text = (text or "").strip()
+    return text if len(text) <= max_len else text[:max_len - 1] + "…"
+
+_PDF_CELL_STYLE = ParagraphStyle("pdf_cell", fontName="Sarabun", fontSize=5.5, leading=6.3, alignment=1)
+_PDF_HEADER_STYLE = ParagraphStyle("pdf_header", fontName="Sarabun-Bold", fontSize=6, leading=7, alignment=1, textColor=colors.white)
+_PDF_TITLE_STYLE = ParagraphStyle("pdf_title", fontName="Sarabun-Bold", fontSize=8, leading=10)
+_PDF_SUBTITLE_STYLE = ParagraphStyle("pdf_subtitle", fontName="Sarabun", fontSize=6.5, leading=8, textColor=colors.HexColor("#6B7280"))
+
+def _pdf_cell_paragraph(lines):
+    parts = [_xml_escape(l) for l in lines if l]
+    if not parts:
+        return ""
+    return Paragraph("<br/>".join(parts), _PDF_CELL_STYLE)
+
+def _build_pdf_grid_block(title: str, subtitle: str, entries_by_slot: dict, cell_lines_fn):
+    """ตาราง 1 อัน (วัน x คาบ) สำหรับ 1 คน/ห้อง พร้อมหัวข้อชื่อด้านบน"""
+    header = [""] + [PDF_DAY_LABELS[d] for d in PDF_DAYS_ORDER]
+    header = [Paragraph(h, _PDF_HEADER_STYLE) if h else "" for h in header]
+    rows = [header]
+    for p in PDF_PERIODS:
+        row = [Paragraph(str(p), _PDF_HEADER_STYLE)]
+        for d in PDF_DAYS_ORDER:
+            entry = entries_by_slot.get((d, p))
+            row.append(_pdf_cell_paragraph(cell_lines_fn(entry)) if entry else "")
+        rows.append(row)
+
+    tbl = Table(rows, colWidths=[13] + [56] * 5, rowHeights=10.3)
+    tbl.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#2563EB")),
+        ("BACKGROUND", (0, 1), (0, -1), colors.HexColor("#F3F4F6")),
+        ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#9CA3AF")),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+        ("TOPPADDING", (0, 0), (-1, -1), 0.5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 0.5),
+        ("LEFTPADDING", (0, 0), (-1, -1), 1),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 1),
+    ]))
+
+    block = [Paragraph(_xml_escape(title), _PDF_TITLE_STYLE)]
+    if subtitle:
+        block.append(Paragraph(_xml_escape(subtitle), _PDF_SUBTITLE_STYLE))
+    block.append(Spacer(1, 2))
+    block.append(tbl)
+    return block
+
+def _generate_grid_pdf(items: list, per_page: int = 6) -> bytes:
+    """items: [{"title","subtitle","entries_by_slot","cell_lines_fn"}, ...] -> รวมเป็น PDF ไฟล์เดียว หน้าละ `per_page` ตาราง (2 คอลัมน์)"""
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=landscape(A4), topMargin=16, bottomMargin=16, leftMargin=16, rightMargin=16)
+    story = []
+    cols = 2
+    rows_per_page = per_page // cols
+
+    if not items:
+        story.append(Paragraph("ไม่มีข้อมูลตารางสอน", _PDF_TITLE_STYLE))
+
+    for i in range(0, len(items), per_page):
+        chunk = items[i:i + per_page]
+        cells = [_build_pdf_grid_block(it["title"], it.get("subtitle", ""), it["entries_by_slot"], it["cell_lines_fn"]) for it in chunk]
+        while len(cells) < per_page:
+            cells.append([Spacer(1, 1)])
+        grid_rows = [cells[r * cols:(r + 1) * cols] for r in range(rows_per_page)]
+        outer = Table(grid_rows, colWidths=[400, 400])
+        outer.setStyle(TableStyle([
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 8),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+            ("TOPPADDING", (0, 0), (-1, -1), 6),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 10),
+            ("LINEAFTER", (0, 0), (0, -1), 0.5, colors.HexColor("#E5E7EB")),
+        ]))
+        story.append(outer)
+        if i + per_page < len(items):
+            story.append(PageBreak())
+
+    doc.build(story)
+    buf.seek(0)
+    return buf.getvalue()
+
+def _pdf_response(pdf_bytes: bytes, filename: str) -> StreamingResponse:
+    return StreamingResponse(io.BytesIO(pdf_bytes), media_type="application/pdf",
+                              headers={"Content-Disposition": f'attachment; filename="{filename}"'})
+
+@app.get("/export/pdf/teachers")
+async def export_teachers_pdf(year_key: Optional[str] = None, plan_id: Optional[str] = None, term_id: Optional[str] = None):
+    if not db: raise HTTPException(status_code=500, detail="Firestore not initialized")
+    if not PDF_FONT_OK: raise HTTPException(status_code=500, detail="ไม่พบไฟล์ฟอนต์สำหรับสร้าง PDF (backend/fonts/)")
+    entries = _load_enriched_schedule_entries(year_key, plan_id, term_id)
+    docs = db.collection("teachers").where("year_key", "==", year_key).stream() if year_key else db.collection("teachers").stream()
+    teacher_list = [{"id": d.id, **d.to_dict()} for d in docs]
+    teacher_list.sort(key=lambda t: (0, _natural_key(t.get("teacher_code"))) if t.get("teacher_code") else (1, _natural_key(t.get("full_name"))))
+
+    items = []
+    for t in teacher_list:
+        by_slot = {}
+        for e in entries:
+            if t["id"] in e["teacher_ids"]:
+                by_slot[(e["day_of_week"], e["period_number"])] = e
+        title = (f"[{t.get('teacher_code')}] " if t.get("teacher_code") else "") + (t.get("full_name") or "")
+
+        def cell_lines(e, self_id=t["id"]):
+            code = e["subject_name"].split(" ")[0]
+            cls = "/".join(e["classroom_names"]) if e["classroom_names"] else "ชมน."
+            co_teachers = [n for tid, n in zip(e["teacher_ids"], e["teacher_names"]) if tid != self_id]
+            lines = [code, _pdf_shorten(cls, 10)]
+            if co_teachers:
+                lines.append("ร่วม:" + _pdf_shorten("/".join(co_teachers), 10))
+            return lines
+
+        items.append({"title": title, "subtitle": t.get("department") or "", "entries_by_slot": by_slot, "cell_lines_fn": cell_lines})
+
+    pdf_bytes = _generate_grid_pdf(items)
+    return _pdf_response(pdf_bytes, "teachtabel_teacher_schedules.pdf")
+
+@app.get("/export/pdf/classrooms")
+async def export_classrooms_pdf(year_key: Optional[str] = None, plan_id: Optional[str] = None, term_id: Optional[str] = None):
+    if not db: raise HTTPException(status_code=500, detail="Firestore not initialized")
+    if not PDF_FONT_OK: raise HTTPException(status_code=500, detail="ไม่พบไฟล์ฟอนต์สำหรับสร้าง PDF (backend/fonts/)")
+    entries = _load_enriched_schedule_entries(year_key, plan_id, term_id)
+    docs = db.collection("classrooms").where("year_key", "==", year_key).stream() if year_key else db.collection("classrooms").stream()
+    classroom_list = [{"id": d.id, **d.to_dict()} for d in docs]
+    classroom_list.sort(key=lambda c: (_natural_key(c.get("grade_level")), _natural_key(c.get("room_name"))))
+
+    items = []
+    for c in classroom_list:
+        by_slot = {}
+        for e in entries:
+            if c["id"] in e["classroom_ids"]:
+                by_slot[(e["day_of_week"], e["period_number"])] = e
+        title = f"{c.get('grade_level', '')}/{c.get('room_name', '')}"
+
+        def cell_lines(e):
+            code = e["subject_name"].split(" ")[0]
+            tnames = "/".join(_pdf_shorten(n, 8) for n in e["teacher_names"]) or "-"
+            return [code, tnames]
+
+        items.append({"title": title, "subtitle": "", "entries_by_slot": by_slot, "cell_lines_fn": cell_lines})
+
+    pdf_bytes = _generate_grid_pdf(items)
+    return _pdf_response(pdf_bytes, "teachtabel_classroom_schedules.pdf")
+
+@app.get("/export/pdf/rooms")
+async def export_rooms_pdf(year_key: Optional[str] = None, plan_id: Optional[str] = None, term_id: Optional[str] = None):
+    if not db: raise HTTPException(status_code=500, detail="Firestore not initialized")
+    if not PDF_FONT_OK: raise HTTPException(status_code=500, detail="ไม่พบไฟล์ฟอนต์สำหรับสร้าง PDF (backend/fonts/)")
+    entries = _load_enriched_schedule_entries(year_key, plan_id, term_id)
+    docs = db.collection("rooms").where("year_key", "==", year_key).stream() if year_key else db.collection("rooms").stream()
+    room_list = [{"id": d.id, **d.to_dict()} for d in docs]
+    room_list.sort(key=lambda r: _natural_key(r.get("room_name")))
+
+    items = []
+    for r in room_list:
+        by_slot = {}
+        for e in entries:
+            if e.get("room_id") == r["id"]:
+                by_slot[(e["day_of_week"], e["period_number"])] = e
+        title = r.get("room_name") or "ไม่ทราบชื่อห้อง"
+
+        def cell_lines(e):
+            cls = "/".join(e["classroom_names"]) or "-"
+            tnames = "/".join(_pdf_shorten(n, 8) for n in e["teacher_names"]) or "-"
+            return [cls, tnames]
+
+        items.append({"title": title, "subtitle": r.get("room_type") or "", "entries_by_slot": by_slot, "cell_lines_fn": cell_lines})
+
+    pdf_bytes = _generate_grid_pdf(items)
+    return _pdf_response(pdf_bytes, "teachtabel_room_schedules.pdf")
 
 # --- IMPORT APIs (รองรับทั้ง .csv และ .xlsx) ---
 
